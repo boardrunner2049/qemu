@@ -49,6 +49,8 @@
 #include "plugin.h"
 #include "elf.h"
 #include "hw/core/cpu.h"
+#include "exec/icount.h"
+#include "system/cpu-timers-internal.h"
 
 /* Uninstall and Reset handlers */
 
@@ -91,6 +93,33 @@ int64_t qemu_plugin_host_start_ns(void) {
 	return qemu_clock_get_ns(QEMU_CLOCK_START);
 }
 
+static int64_t qemu_plugin_get_virtual_time_ns(void)
+{
+    int64_t icount;
+    CPUState *cpu;
+
+    if (!icount_enabled()) {
+        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+
+    /*
+     * Plugin callbacks can run from translated code while can_do_io is false.
+     * qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) would try to commit the current
+     * CPU's partial icount there, which QEMU rejects.  For plugins, return a
+     * read-only view: committed global icount plus this CPU's in-flight budget
+     * consumption.
+     */
+    icount = qatomic_read_i64(&timers_state.qemu_icount);
+    cpu = current_cpu;
+    if (cpu && cpu->running) {
+        icount += cpu->icount_budget -
+            (cpu->neg.icount_decr.u16.low + cpu->icount_extra);
+    }
+
+    return qatomic_read_i64(&timers_state.qemu_icount_bias) +
+        icount_to_ns(icount);
+}
+
 
 void qemu_plugin_pause_vm(void) {
 	qemu_system_vmstop_request(RUN_STATE_PAUSED);
@@ -114,7 +143,7 @@ void budget_exhausted(void * arg) {
 	printf("Budgeting time!!\n");
 
 	qemu_mutex_lock(&bc->lock);
-	uint64_t ts = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+	uint64_t ts = qemu_plugin_get_virtual_time_ns();
 	if (ts >= bc->total_budget) {
 		if (runstate_get() != RUN_STATE_PAUSED) {
 			bc->vm_old_state = runstate_get();
@@ -122,7 +151,7 @@ void budget_exhausted(void * arg) {
 			printf("Stopping vm at %ld \n", ts);
 		}
 		//Try to account for drift
-		bc->total_budget = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+		bc->total_budget = qemu_plugin_get_virtual_time_ns();
     }
     else {
 		vm_resume(bc->vm_old_state);
@@ -206,7 +235,7 @@ static void ptimer_callback(void *opaque) {
     }
 
     // Reschedule for next aligned period
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = qemu_plugin_get_virtual_time_ns();
 
     // If we're behind, skip missed intervals to stay aligned
 	int missed =-1;
@@ -229,7 +258,7 @@ uint64_t qemu_plugin_timer_new_period_ns(void (*cb)(void *), void *data, uint64_
 		ctx->data = data;
 		ctx->cb =cb;
 		ctx->period_ns = period;
-		ctx->next_fire_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ctx->period_ns;
+		ctx->next_fire_ns = qemu_plugin_get_virtual_time_ns() + ctx->period_ns;
 		timer_mod_ns(ctx->timer, ctx->next_fire_ns);
 	} else {
 		printf("Too many timers requested, i will die now");
@@ -617,7 +646,7 @@ GArray *qemu_plugin_get_registers(void)
 
 
 int64_t qemu_plugin_get_virtual_timer(void) {
-	return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+	return qemu_plugin_get_virtual_time_ns();
 }
 
 void raise_irq(CPUState *cs, int irq_num, int secure);
