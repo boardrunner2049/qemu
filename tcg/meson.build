@@ -28,4 +28,5 @@ if host_os == 'linux'
 endif
 
 user_ss.add_all(tcg_ss)
+system_ss.add(files('supercache.c'))
 system_ss.add_all(tcg_ss)

@@ -228,6 +228,8 @@ DEF("accel", HAS_ARG, QEMU_OPTION_accel,
     "                one-insn-per-tb=on|off (one guest instruction per TCG translation block)\n"
     "                split-wx=on|off (enable TCG split w^x mapping)\n"
     "                tb-size=n (TCG translation block cache size)\n"
+    "                supercache=file (persistent TCG translation cache)\n"
+    "                supercache-flat=on|off (flat immutable-firmware lookup)\n"
     "                dirty-ring-size=n (KVM dirty ring GFN count, default 0)\n"
     "                eager-split-size=n (KVM Eager Page Split chunk size, default 0, disabled. ARM only)\n"
     "                notify-vmexit=run|internal-error|disable,notify-window=n (enable notify VM exit and set notify window, x86 only)\n"
@@ -270,6 +272,30 @@ SRST
 
     ``tb-size=n``
         Controls the size (in MiB) of the TCG translation block cache.
+
+    ``supercache=file``
+        Stores generated TCG host code in ``file`` and reuses compatible
+        translations after QEMU is restarted. Guest instruction bytes are
+        checked before a cached translation is activated. The cache is
+        invalidated automatically when QEMU, a loaded plugin, the host
+        executable mappings, or the TCG layout changes. The caller owns
+        invalidation when plugin instrumentation or plugin arguments change.
+
+        Supercache is currently available for x86-64 Linux system emulation.
+        It forces ``thread=single`` and, unless ``tb-size`` is explicitly
+        supplied, uses a 2 GiB sparse cache. Only one QEMU process may open a
+        supercache file at a time. QEMU must be launched with ASLR disabled,
+        for example with ``setarch $(uname -m) -R``. Supercache checks this
+        requirement but does not change the process personality or restart
+        QEMU. ``split-wx=on`` is not supported.
+
+    ``supercache-flat=on|off``
+        Enables an optimized lookup path for immutable firmware whose cached
+        guest PC span is no larger than 512 MiB. Restored translations bypass
+        the normal interval tree, page lists, and QHT. This is faster, but it
+        must not be used with self-modifying or writable executable code. A
+        direct index is used through 32 MiB; larger spans use a compact paged
+        index.
 
     ``thread=single|multi``
         Controls number of TCG threads. When the TCG is multi-threaded

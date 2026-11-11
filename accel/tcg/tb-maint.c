@@ -30,6 +30,7 @@
 #include "tb-internal.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
+#include "tcg/supercache.h"
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "tb-internal.h"
@@ -916,6 +917,15 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
     qemu_spin_unlock(&tb->jmp_lock);
 
+    if (tcg_supercache_flat_invalidate(tb)) {
+        tb_jmp_cache_inval_tb(tb);
+        tb_remove_from_jmp_list(tb, 0);
+        tb_remove_from_jmp_list(tb, 1);
+        tb_jmp_unlink(tb);
+        qatomic_inc(&tb_ctx.tb_phys_invalidate_count);
+        return;
+    }
+
     /* remove the TB from the hash list */
     phys_pc = tb_page_addr0(tb);
     h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
@@ -998,6 +1008,12 @@ TranslationBlock *tb_link_page(TranslationBlock *tb)
 
     tb_unlock_pages(tb);
     return tb;
+}
+
+TranslationBlock *tb_supercache_link(TranslationBlock *tb)
+{
+    tb_lock_pages(tb);
+    return tb_link_page(tb);
 }
 
 #ifdef CONFIG_USER_ONLY

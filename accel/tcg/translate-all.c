@@ -22,6 +22,7 @@
 #include "trace.h"
 #include "disas/disas.h"
 #include "tcg/tcg.h"
+#include "tcg/supercache.h"
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
 #include "exec/tb-flush.h"
@@ -288,6 +289,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     assert_no_pages_locked();
     tb = tcg_tb_alloc(tcg_ctx);
     if (unlikely(!tb)) {
+        if (tcg_supercache_enabled()) {
+            error_report("supercache is full; cached translations were "
+                         "preserved in the cache file");
+            exit(EXIT_FAILURE);
+        }
         /* flush must be done */
         tb_flush(cpu);
         mmap_unlock();
@@ -531,6 +537,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         tcg_tb_remove(tb);
         return existing_tb;
     }
+    tcg_supercache_record(tb, qatomic_read(&tcg_ctx->code_gen_ptr));
     return tb;
 }
 

@@ -28,6 +28,10 @@
 #include "system/replay.h"
 #include "system/system.h"
 
+#ifdef CONFIG_LINUX
+#include <sys/personality.h>
+#endif
+
 #ifdef CONFIG_SDL
 /*
  * SDL insists on wrapping the main() function with its own implementation on
@@ -57,6 +61,77 @@ static void *qemu_default_main(void *opaque)
 
 int (*qemu_main)(void);
 
+static bool qemu_accel_has_supercache(const char *arg)
+{
+    const char *option = arg;
+
+    while ((option = strstr(option, "supercache="))) {
+        if (option == arg || option[-1] == ',') {
+            return true;
+        }
+        option++;
+    }
+    return false;
+}
+
+/*
+ * Native TCG code contains absolute addresses into QEMU and its plugins.
+ * Supercache deliberately does not change the process personality or re-exec:
+ * callers must opt in to stable addresses before starting QEMU.
+ */
+static void qemu_supercache_check_aslr(int argc, char **argv)
+{
+#ifdef CONFIG_LINUX
+    bool requested = false;
+    int persona;
+
+    for (int i = 1; i < argc; i++) {
+        const char *accel = NULL;
+
+        if (!strcmp(argv[i], "-accel") && i + 1 < argc) {
+            accel = argv[++i];
+        } else if (g_str_has_prefix(argv[i], "-accel=")) {
+            accel = argv[i] + strlen("-accel=");
+        }
+        if (accel && qemu_accel_has_supercache(accel)) {
+            requested = true;
+            break;
+        }
+    }
+    if (!requested) {
+        return;
+    }
+
+    persona = personality(0xffffffffUL);
+    if (persona < 0) {
+        perror("supercache: personality");
+        exit(EXIT_FAILURE);
+    }
+    if (persona & ADDR_NO_RANDOMIZE) {
+        return;
+    }
+    fprintf(stderr,
+            "supercache requires QEMU to be started with ASLR disabled; "
+            "run it as:\n  setarch $(uname -m) -R %s ...\n",
+            argv[0]);
+    exit(EXIT_FAILURE);
+#else
+    for (int i = 1; i < argc; i++) {
+        const char *accel = NULL;
+
+        if (!strcmp(argv[i], "-accel") && i + 1 < argc) {
+            accel = argv[++i];
+        } else if (g_str_has_prefix(argv[i], "-accel=")) {
+            accel = argv[i] + strlen("-accel=");
+        }
+        if (accel && qemu_accel_has_supercache(accel)) {
+            fprintf(stderr, "supercache is supported only on Linux\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+#endif
+}
+
 #ifdef CONFIG_DARWIN
 static int os_darwin_cfrunloop_main(void)
 {
@@ -67,7 +142,8 @@ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 #endif
 int main(int argc, char **argv)
 {
-	qemu_host_clock_start();
+    qemu_supercache_check_aslr(argc, argv);
+    qemu_host_clock_start();
     qemu_init(argc, argv);
 
     /*

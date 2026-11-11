@@ -31,6 +31,7 @@
 #include "qemu/qtree.h"
 #include "qapi/error.h"
 #include "tcg/tcg.h"
+#include "tcg/supercache.h"
 #include "exec/translation-block.h"
 #include "tcg-internal.h"
 #include "host/cpuinfo.h"
@@ -248,9 +249,12 @@ void tcg_tb_remove(TranslationBlock *tb)
 TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
 {
     struct tcg_region_tree *rt = tc_ptr_to_region_tree((void *)tc_ptr);
-    TranslationBlock *tb;
+    TranslationBlock *tb = tcg_supercache_host_lookup(tc_ptr);
     struct tb_tc s = { .ptr = (void *)tc_ptr };
 
+    if (tb) {
+        return tb;
+    }
     if (rt == NULL) {
         return NULL;
     }
@@ -408,6 +412,16 @@ void tcg_region_reset_all(void)
 {
     unsigned int n_ctxs = qatomic_read(&tcg_cur_ctxs);
     unsigned int i;
+
+    if (tcg_supercache_enabled()) {
+        /*
+         * Preserve allocation state.  The QHT and page lists have already
+         * been cleared; cached TBs will be validated and relinked lazily.
+         */
+        tcg_supercache_runtime_reset();
+        tcg_region_tree_reset_all();
+        return;
+    }
 
     qemu_mutex_lock(&region.lock);
     region.current = 0;
@@ -687,6 +701,20 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
 {
     ERRP_GUARD();
     int prot, flags;
+    void *supercache_buffer = NULL;
+    int supercache_prot;
+
+    supercache_prot = tcg_supercache_alloc_code_buffer(size,
+                                                       &supercache_buffer,
+                                                       errp);
+    if (supercache_prot < 0) {
+        return -1;
+    }
+    if (tcg_supercache_enabled()) {
+        region.start_aligned = supercache_buffer;
+        region.total_size = size;
+        return supercache_prot;
+    }
 
     if (splitwx) {
         prot = alloc_code_gen_buffer_splitwx(size, errp);
@@ -865,6 +893,7 @@ void tcg_region_prologue_set(TCGContext *s)
 
     /* Recompute boundaries of the first region. */
     tcg_region_assign(s, 0);
+    tcg_supercache_after_prologue(s);
 
     /* Register the balance of the buffer with gdb. */
     tcg_register_jit(tcg_splitwx_to_rx(region.after_prologue),

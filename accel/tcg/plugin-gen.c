@@ -25,9 +25,13 @@
 #include "tcg/tcg.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg/tcg-op-common.h"
+#include "tcg/insn-start-words.h"
 #include "exec/plugin-gen.h"
 #include "exec/translator.h"
 #include "exec/translation-block.h"
+#include "exec/target_page.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "internal-common.h"
 
 enum plugin_gen_from {
     PLUGIN_GEN_FROM_TB,
@@ -619,6 +623,117 @@ void plugin_gen_tb_end(CPUState *cpu, size_t num_insns)
     plugin_gen_inject(ptb);
 
     /* reset plugin translation state (plugin_tb is reused between blocks) */
+    tcg_ctx->plugin_db = NULL;
+    tcg_ctx->plugin_insn = NULL;
+}
+
+static int64_t supercache_decode_sleb128(const uint8_t **pp)
+{
+    const uint8_t *p = *pp;
+    int64_t value = 0;
+    int byte;
+    int shift = 0;
+
+    do {
+        byte = *p++;
+        value |= (int64_t)(byte & 0x7f) << shift;
+        shift += 7;
+    } while (byte & 0x80);
+    if (shift < 64 && (byte & 0x40)) {
+        value |= -(int64_t)1 << shift;
+    }
+    *pp = p;
+    return value;
+}
+
+/*
+ * Re-run translation callbacks for a restored native TB.  Plugins frequently
+ * use these callbacks to initialize data referenced by their generated
+ * instrumentation.  No TCG operations are emitted here: the instrumentation
+ * itself is already present in the cached host code.
+ */
+void qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
+                                      vaddr pc)
+{
+    DisasContextBase db = { 0 };
+    struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
+    uint64_t insn_data[INSN_START_WORDS] = { 0 };
+    const uint8_t *search = tb->tc.ptr + tb->tc.size;
+    void *host_pc = NULL;
+
+    if (!test_bit(QEMU_PLUGIN_EV_VCPU_TB_TRANS,
+                  cpu->plugin_state->event_mask)) {
+        return;
+    }
+
+    if (!ptb) {
+        ptb = g_new0(struct qemu_plugin_tb, 1);
+        ptb->insns = g_ptr_array_new();
+        tcg_ctx->plugin_tb = ptb;
+    }
+    if (ptb->cbs) {
+        g_array_set_size(ptb->cbs, 0);
+    }
+    ptb->n = tb->icount;
+    ptb->mem_helper = false;
+
+    if (!(tb_cflags(tb) & CF_PCREL)) {
+        insn_data[0] = tb->pc;
+    }
+    for (size_t i = 0; i < ptb->n; i++) {
+        struct qemu_plugin_insn *insn;
+
+        for (size_t j = 0; j < INSN_START_WORDS; j++) {
+            insn_data[j] += supercache_decode_sleb128(&search);
+        }
+        /* Skip the encoded host instruction-end delta. */
+        supercache_decode_sleb128(&search);
+
+        if (i < ptb->insns->len) {
+            insn = g_ptr_array_index(ptb->insns, i);
+        } else {
+            insn = g_new0(struct qemu_plugin_insn, 1);
+            g_ptr_array_add(ptb->insns, insn);
+        }
+        if (insn->insn_cbs) {
+            g_array_set_size(insn->insn_cbs, 0);
+        }
+        if (insn->mem_cbs) {
+            g_array_set_size(insn->mem_cbs, 0);
+        }
+        insn->vaddr = insn_data[0];
+        if (tb_cflags(tb) & CF_PCREL) {
+            insn->vaddr += pc & TARGET_PAGE_MASK;
+        }
+        insn->calls_helpers = false;
+        insn->mem_helper = false;
+    }
+    for (size_t i = 0; i < ptb->n; i++) {
+        struct qemu_plugin_insn *insn = g_ptr_array_index(ptb->insns, i);
+        vaddr end = i + 1 < ptb->n
+            ? ((struct qemu_plugin_insn *)
+               g_ptr_array_index(ptb->insns, i + 1))->vaddr
+            : pc + tb->size;
+
+        insn->len = end - insn->vaddr;
+    }
+
+    get_page_addr_code_hostp(cpu_env(cpu), pc, &host_pc);
+    db.tb = tb;
+    db.pc_first = pc;
+    db.pc_next = pc + tb->size;
+    db.num_insns = tb->icount;
+    db.host_addr[0] = host_pc;
+    db.code_mmuidx = cpu_mmu_index(cpu, true);
+    if (tb_page_addr1(tb) != (tb_page_addr_t)-1) {
+        get_page_addr_code_hostp(cpu_env(cpu), TARGET_PAGE_ALIGN(pc),
+                                 &db.host_addr[1]);
+    }
+
+    tcg_ctx->plugin_db = &db;
+    tcg_ctx->gen_tb = tb;
+    qemu_plugin_tb_trans_cb(cpu, ptb);
+    tcg_ctx->gen_tb = NULL;
     tcg_ctx->plugin_db = NULL;
     tcg_ctx->plugin_insn = NULL;
 }

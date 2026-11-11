@@ -163,6 +163,8 @@ CPUPluginState *qemu_plugin_create_vcpu_state(void);
 void qemu_plugin_vcpu_init_hook(CPUState *cpu);
 void qemu_plugin_vcpu_exit_hook(CPUState *cpu);
 void qemu_plugin_tb_trans_cb(CPUState *cpu, struct qemu_plugin_tb *tb);
+void qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
+                                      vaddr pc);
 void qemu_plugin_vcpu_idle_cb(CPUState *cpu);
 void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
 void
@@ -239,6 +241,10 @@ static inline void qemu_plugin_vcpu_exit_hook(CPUState *cpu)
 
 static inline void qemu_plugin_tb_trans_cb(CPUState *cpu,
                                            struct qemu_plugin_tb *tb)
+{ }
+
+static inline void
+qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb, vaddr pc)
 { }
 
 static inline void qemu_plugin_vcpu_idle_cb(CPUState *cpu)

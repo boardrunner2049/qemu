@@ -32,6 +32,7 @@
 #include "exec/mmap-lock.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
+#include "tcg/supercache.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -195,6 +196,7 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     tb_page_addr_t phys_pc;
     struct tb_desc desc;
+    TranslationBlock *tb;
     uint32_t h;
 
     desc.s = s;
@@ -206,7 +208,11 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
     desc.page_addr0 = phys_pc;
     h = tb_hash_func(phys_pc, (s.cflags & CF_PCREL ? 0 : s.pc),
                      s.flags, s.cs_base, s.cflags);
-    return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+    tb = qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+    if (!tb) {
+        tb = tcg_supercache_lookup(cpu, s, phys_pc);
+    }
+    return tb;
 }
 
 /**

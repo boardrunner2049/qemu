@@ -28,6 +28,7 @@
 #include "exec/replay-core.h"
 #include "exec/icount.h"
 #include "tcg/startup.h"
+#include "tcg/supercache.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
@@ -50,6 +51,8 @@ struct TCGState {
     bool one_insn_per_tb;
     int splitwx_enabled;
     unsigned long tb_size;
+    char *supercache;
+    bool supercache_flat;
 };
 typedef struct TCGState TCGState;
 
@@ -84,6 +87,21 @@ static int tcg_init_machine(MachineState *ms)
 {
     TCGState *s = TCG_STATE(current_accel());
     unsigned max_threads = 1;
+
+    if (s->supercache_flat && !s->supercache) {
+        error_report("supercache-flat requires supercache=file");
+        return -EINVAL;
+    }
+    if (s->supercache) {
+        if (s->mttcg_enabled == ON_OFF_AUTO_ON) {
+            warn_report("supercache forces TCG thread=single");
+        }
+        s->mttcg_enabled = ON_OFF_AUTO_OFF;
+        if (s->tb_size == 0) {
+            /* The x86-64 backend's safe direct-branch limit. */
+            s->tb_size = 2048;
+        }
+    }
 
 #ifndef CONFIG_USER_ONLY
     CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
@@ -128,6 +146,8 @@ static int tcg_init_machine(MachineState *ms)
 
     page_init();
     tb_htable_init();
+    tcg_supercache_configure(s->supercache, s->supercache_flat,
+                             s->splitwx_enabled, max_threads);
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
 
 #if defined(CONFIG_SOFTMMU)
@@ -193,6 +213,29 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+static char *tcg_get_supercache(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->supercache);
+}
+
+static void tcg_set_supercache(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    g_free(s->supercache);
+    s->supercache = g_strdup(value);
+}
+
+static bool tcg_get_supercache_flat(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->supercache_flat;
+}
+
+static void tcg_set_supercache_flat(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->supercache_flat = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -254,6 +297,16 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "tb-size",
         "TCG translation block cache size");
 
+    object_class_property_add_str(oc, "supercache",
+        tcg_get_supercache, tcg_set_supercache);
+    object_class_property_set_description(oc, "supercache",
+        "Persistent file-backed TCG translation cache");
+
+    object_class_property_add_bool(oc, "supercache-flat",
+        tcg_get_supercache_flat, tcg_set_supercache_flat);
+    object_class_property_set_description(oc, "supercache-flat",
+        "Use flat lookup tables for immutable firmware in supercache");
+
     object_class_property_add_bool(oc, "split-wx",
         tcg_get_splitwx, tcg_set_splitwx);
     object_class_property_set_description(oc, "split-wx",
@@ -266,10 +319,16 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Only put one guest insn in each translation block");
 }
 
+static void tcg_accel_instance_finalize(Object *obj)
+{
+    g_free(TCG_STATE(obj)->supercache);
+}
+
 static const TypeInfo tcg_accel_type = {
     .name = TYPE_TCG_ACCEL,
     .parent = TYPE_ACCEL,
     .instance_init = tcg_accel_instance_init,
+    .instance_finalize = tcg_accel_instance_finalize,
     .class_init = tcg_accel_class_init,
     .instance_size = sizeof(TCGState),
 };
