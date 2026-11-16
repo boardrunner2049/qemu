@@ -255,6 +255,18 @@ void qemu_plugin_vmstate(void);
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_wait_for_budget(void);
 
+/**
+ * qemu_plugin_set_budget_exact_stop() - halt exactly on the budget deadline
+ * @exact: true to stop the guest precisely on its deadline
+ *
+ * By default the guest halts at the first translation-block boundary at or
+ * after its budget deadline, overshooting by roughly one execution round. When
+ * @exact is true the VM is stopped synchronously from the deadline timer
+ * instead, so virtual time lands exactly on the budget.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_set_budget_exact_stop(bool exact);
+
 QEMU_PLUGIN_API
 void qemu_plugin_register_irq_hook(void (*cb)(int), void (*cb_end)(int));
 

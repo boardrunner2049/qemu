@@ -77,12 +77,73 @@
 ##
 # @Budget:
 #
-# @totalbudget: current_budget
+# @totalbudget: cumulative virtual-time deadline, in nanoseconds, that the
+#     guest has been granted since startup.
+#
+# @currenttime: the guest's virtual time, in nanoseconds, at the moment this
+#     command returned.  `run-for` is asynchronous: it grants budget, resumes
+#     the guest and returns immediately, so the value reported by `run-for`
+#     precedes the slice it just granted.  Wait for the STOP event and then
+#     call `query-budget` to read the time the guest actually reached.  The
+#     guest halts at a translation-block boundary at or after the deadline, so
+#     that value may exceed @totalbudget; a co-simulation master reconciles
+#     against it rather than assuming it received exactly what it requested.
+#
+# @exact: whether exact-stop mode is enabled.  When false (the default) the
+#     guest halts at the first translation-block boundary at or after the
+#     deadline, typically overshooting by a fixed cost of roughly one
+#     execution round.  When true it halts precisely on the deadline, so
+#     @currenttime equals @totalbudget after every slice.
 #
 # Since: 1.2
 ##
 { 'struct': 'Budget', 
-  'data': { 'totalbudget': 'uint64' } }
+  'data': { 'totalbudget': 'uint64', 'currenttime': 'uint64', 'exact': 'bool' } }
+
+##
+# @set-budget-mode:
+#
+# Choose how the guest halts when its budget deadline is reached.
+#
+# @exact: true to halt precisely on the deadline.  This stops the VM
+#     synchronously from the deadline timer instead of raising an
+#     asynchronous stop request, which costs a vCPU pause on the main loop but
+#     removes the overshoot entirely.  Off by default, so existing behaviour is
+#     unchanged unless a master asks for it.
+#
+# Returns: the resulting budget state.
+#
+# Since: 1.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "set-budget-mode", "arguments": { "exact": true } }
+#     <- { "return": { "totalbudget": 0, "currenttime": 0, "exact": true } }
+##
+{ 'command': 'set-budget-mode',
+  'data': { 'exact': 'bool' },
+  'returns': 'Budget',
+  'allow-preconfig': true }
+
+##
+# @query-budget:
+#
+# Report the guest's current virtual time and cumulative budget deadline
+# without granting any further execution.  Intended for a co-simulation master
+# to read the guest's position after a STOP event.
+#
+# Returns: the current budget state.
+#
+# Since: 1.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-budget" }
+#     <- { "return": { "totalbudget": 20000000, "currenttime": 20000512 } }
+##
+{ 'command': 'query-budget',
+  'returns': 'Budget',
+  'allow-preconfig': true }
 ##
 # @run-for:
 #

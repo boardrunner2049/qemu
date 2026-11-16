@@ -55,9 +55,13 @@ typedef struct BudgetControl {
     QEMUTimer budget_timer;
     QEMUTimerCB * cb;
 	RunState vm_old_state;
+	bool exact_stop;
 } BudgetControl;
 
 extern void budget_exhausted(void *);
+extern uint64_t budget_current_time_ns(void);
+extern void budget_set_exact_stop(bool exact);
+extern bool budget_get_exact_stop(void);
 BudgetControl bc_tcb;
 static int bc_tcb_post_load(void *opaque, int version_id)
 {
@@ -107,24 +111,71 @@ void init_budget_system(void) {
         bc_tcb.budget_init = 1;
         //TODO: Hack read from snaphot maybe.
         bc_tcb.vm_old_state = RUN_STATE_RUNNING;
+
+}
+
+/*
+ * run-for arrives on the main loop thread while qemu_plugin_wait_for_budget()
+ * runs on a vCPU thread, so a plain `if (!budget_init) init()` could run the
+ * initializer twice and leave two threads with different mutexes.  g_once
+ * makes first use safe from either side.
+ */
+void budget_system_ensure_init(void);
+void budget_system_ensure_init(void) {
+	static gsize initialized;
+
+	if (g_once_init_enter(&initialized)) {
+		init_budget_system();
+		g_once_init_leave(&initialized, 1);
+	}
 }
 
 Budget *qmp_run_for(uint64_t budget, Error **errp) {
 	Budget * total;
 
-	//TODO: Potential race in init
-	if (!bc_tcb.budget_init) {
-		init_budget_system();
-    }
+	budget_system_ensure_init();
 
 	total = g_new0(Budget, 1);
 	qemu_mutex_lock(&bc_tcb.lock);
 	bc_tcb.total_budget += budget;
 	qemu_mutex_unlock(&bc_tcb.lock);
+
+	/*
+	 * bc_tcb.cb() takes the same lock, so it must be called unlocked. Re-take
+	 * the lock afterwards: the callback may have snapped total_budget forward
+	 * to absorb guest overshoot, and an unlocked read could tear or observe a
+	 * stale value.
+	 */
 	bc_tcb.cb(&bc_tcb);
+
+	qemu_mutex_lock(&bc_tcb.lock);
 	total->totalbudget = bc_tcb.total_budget;
+	total->currenttime = budget_current_time_ns();
+	total->exact = bc_tcb.exact_stop;
+	qemu_mutex_unlock(&bc_tcb.lock);
 
 	return total;
+}
+
+Budget *qmp_query_budget(Error **errp) {
+	Budget * state;
+
+	budget_system_ensure_init();
+
+	state = g_new0(Budget, 1);
+	qemu_mutex_lock(&bc_tcb.lock);
+	state->totalbudget = bc_tcb.total_budget;
+	state->currenttime = budget_current_time_ns();
+	state->exact = bc_tcb.exact_stop;
+	qemu_mutex_unlock(&bc_tcb.lock);
+
+	return state;
+}
+
+Budget *qmp_set_budget_mode(bool exact, Error **errp) {
+	budget_system_ensure_init();
+	budget_set_exact_stop(exact);
+	return qmp_query_budget(errp);
 }
 
 ObjectPropertyInfoList *qmp_qom_list(const char *path, Error **errp)

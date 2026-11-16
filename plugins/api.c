@@ -49,6 +49,8 @@
 #include "plugin.h"
 #include "elf.h"
 #include "hw/core/cpu.h"
+#include "exec/icount.h"
+#include "system/cpu-timers-internal.h"
 
 /* Uninstall and Reset handlers */
 
@@ -91,6 +93,33 @@ int64_t qemu_plugin_host_start_ns(void) {
 	return qemu_clock_get_ns(QEMU_CLOCK_START);
 }
 
+static int64_t qemu_plugin_get_virtual_time_ns(void)
+{
+    int64_t icount;
+    CPUState *cpu;
+
+    if (!icount_enabled()) {
+        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+
+    /*
+     * Plugin callbacks can run from translated code while can_do_io is false.
+     * qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) would try to commit the current
+     * CPU's partial icount there, which QEMU correctly rejects.  For plugins,
+     * return a read-only view of virtual time instead: committed global icount
+     * plus this CPU's in-flight budget consumption.
+     */
+    icount = qatomic_read_i64(&timers_state.qemu_icount);
+    cpu = current_cpu;
+    if (cpu && cpu->running) {
+        icount += cpu->icount_budget -
+            (cpu->neg.icount_decr.u16.low + cpu->icount_extra);
+    }
+
+    return qatomic_read_i64(&timers_state.qemu_icount_bias) +
+        icount_to_ns(icount);
+}
+
 
 void qemu_plugin_pause_vm(void) {
 	qemu_system_vmstop_request(RUN_STATE_PAUSED);
@@ -104,42 +133,124 @@ typedef struct BudgetControl {
     QEMUTimer budget_timer;
 	QEMUTimerCB * cb;
 	RunState vm_old_state;
+	bool exact_stop;
 } BudgetControl;
 
 extern BudgetControl bc_tcb;
 
+/*
+ * Budget tracing is off by default: budget_exhausted() runs on every granted
+ * slice, so unconditional printf() here dominates the output of a
+ * co-simulation master that steps in small increments.  Set
+ * FASTDYN_BUDGET_DEBUG=1 to restore the diagnostics.
+ */
+static bool budget_debug_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *raw = getenv("FASTDYN_BUDGET_DEBUG");
+        cached = (raw && raw[0] && strcmp(raw, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+#define budget_debug(fmt, ...) \
+    do { \
+        if (budget_debug_enabled()) { \
+            fprintf(stderr, "[budget] " fmt "\n", ##__VA_ARGS__); \
+        } \
+    } while (0)
+
 void budget_exhausted(void * arg);
 void budget_exhausted(void * arg) {
 	BudgetControl * bc = (BudgetControl *) arg;
-	printf("Budgeting time!!\n");
+	bool stop_synchronously = false;
 
 	qemu_mutex_lock(&bc->lock);
-	uint64_t ts = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+	uint64_t ts = qemu_plugin_get_virtual_time_ns();
 	if (ts >= bc->total_budget) {
 		if (runstate_get() != RUN_STATE_PAUSED) {
 			bc->vm_old_state = runstate_get();
-    	    qemu_system_vmstop_request(RUN_STATE_PAUSED);
-			printf("Stopping vm at %ld \n", ts);
+			/*
+			 * qemu_system_vmstop_request() only raises a flag; the main loop
+			 * pauses the VM when it next checks.  Under icount the vCPU keeps
+			 * retiring instructions until then, and every instruction advances
+			 * virtual time, so the guest halts past its deadline.
+			 *
+			 * In exact mode stop the VM synchronously instead.  This timer
+			 * callback runs on the main loop with icount having already stopped
+			 * the vCPU precisely at the deadline, so pausing here leaves virtual
+			 * time exactly on total_budget.  It is only taken on the main loop:
+			 * from a vCPU thread vm_stop() would just re-request the async stop.
+			 * vm_stop() is called with bc->lock released, because it pauses every
+			 * vCPU and a vCPU blocked on this lock (reachable through the
+			 * start_budgeting virtual) would otherwise deadlock.
+			 */
+			if (bc->exact_stop && qemu_in_main_thread()) {
+				stop_synchronously = true;
+			} else {
+				qemu_system_vmstop_request(RUN_STATE_PAUSED);
+			}
+			budget_debug("stopping vm at %" PRIu64 " ns%s", ts,
+			             stop_synchronously ? " (exact)" : "");
 		}
-		//Try to account for drift
-		bc->total_budget = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+		/*
+		 * The guest stops at a translation-block boundary at or after the
+		 * deadline, so it may overshoot.  Snap the budget forward to the time
+		 * actually reached; a master reconciles using the current_time field
+		 * returned by run-for rather than assuming it received exactly the
+		 * budget it asked for.
+		 */
+		bc->total_budget = ts;
     }
     else {
 		vm_resume(bc->vm_old_state);
-		printf("See you in %ld\n", bc->total_budget);
+		budget_debug("resuming until %" PRIu64 " ns", bc->total_budget);
         timer_mod_ns(&bc->budget_timer, bc->total_budget); 
     }
 
 	qemu_mutex_unlock(&bc->lock);
+
+	if (stop_synchronously) {
+		vm_stop(RUN_STATE_PAUSED);
+	}
 }
 
-extern void init_budget_system(void);
+extern void budget_system_ensure_init(void);
 uint64_t qemu_plugin_wait_for_budget(void) {
-	if (!bc_tcb.budget_init) {
-		init_budget_system();
-	}
+	budget_system_ensure_init();
 	budget_exhausted(&bc_tcb);
 	return 0;
+}
+
+/* Read the guest's virtual time for the budget/co-simulation interface. */
+uint64_t budget_current_time_ns(void);
+uint64_t budget_current_time_ns(void) {
+	return (uint64_t)qemu_plugin_get_virtual_time_ns();
+}
+
+/* Exact-stop mode: halt precisely on the deadline rather than after it. */
+void budget_set_exact_stop(bool exact);
+void budget_set_exact_stop(bool exact) {
+	budget_system_ensure_init();
+	qemu_mutex_lock(&bc_tcb.lock);
+	bc_tcb.exact_stop = exact;
+	qemu_mutex_unlock(&bc_tcb.lock);
+}
+
+/*
+ * Plugin-facing selection of exact-stop mode.  A plugin configures this from
+ * its own options at install time, so the choice travels with the run's
+ * configuration rather than through the environment.
+ */
+void qemu_plugin_set_budget_exact_stop(bool exact) {
+	budget_set_exact_stop(exact);
+}
+
+bool budget_get_exact_stop(void);
+bool budget_get_exact_stop(void) {
+	return bc_tcb.exact_stop;
 }
 //Hook to register loader functions.
 extern void plugin_vmstate_budget(void);
@@ -206,7 +317,7 @@ static void ptimer_callback(void *opaque) {
     }
 
     // Reschedule for next aligned period
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = qemu_plugin_get_virtual_time_ns();
 
     // If we're behind, skip missed intervals to stay aligned
 	int missed =-1;
@@ -229,7 +340,7 @@ uint64_t qemu_plugin_timer_new_period_ns(void (*cb)(void *), void *data, uint64_
 		ctx->data = data;
 		ctx->cb =cb;
 		ctx->period_ns = period;
-		ctx->next_fire_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ctx->period_ns;
+		ctx->next_fire_ns = qemu_plugin_get_virtual_time_ns() + ctx->period_ns;
 		timer_mod_ns(ctx->timer, ctx->next_fire_ns);
 	} else {
 		printf("Too many timers requested, i will die now");
@@ -617,7 +728,7 @@ GArray *qemu_plugin_get_registers(void)
 
 
 int64_t qemu_plugin_get_virtual_timer(void) {
-	return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+	return qemu_plugin_get_virtual_time_ns();
 }
 
 void raise_irq(CPUState *cs, int irq_num, int secure);

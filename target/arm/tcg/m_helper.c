@@ -1675,19 +1675,6 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                 v7m_stack_read(cpu, &env->regs[10], frameptr + 0x20, mmu_idx) &&
                 v7m_stack_read(cpu, &env->regs[11], frameptr + 0x24, mmu_idx);
 
-			/* After reading registers from the stack */
-#if 0
-			printf("Frame Pointer (SP):  0x%08x\n", frameptr);
-printf("R4 = 0x%08x\n", env->regs[4]);
-printf("R5 = 0x%08x\n", env->regs[5]);
-printf("R6 = 0x%08x\n", env->regs[6]);
-printf("R7 = 0x%08x\n", env->regs[7]);
-printf("R8 = 0x%08x\n", env->regs[8]);
-printf("R9 = 0x%08x\n", env->regs[9]);
-printf("R10 = 0x%08x\n", env->regs[10]);
-printf("R11 = 0x%08x\n", env->regs[11]);
-#endif
-
             frameptr += 0x28;
         }
 
@@ -1701,21 +1688,6 @@ printf("R11 = 0x%08x\n", env->regs[11]);
             v7m_stack_read(cpu, &env->regs[14], frameptr + 0x14, mmu_idx) &&
             v7m_stack_read(cpu, &env->regs[15], frameptr + 0x18, mmu_idx) &&
             v7m_stack_read(cpu, &xpsr, frameptr + 0x1c, mmu_idx);
-
-		if (pop_ok) {
-#if 0
-			printf("Context Switch:\n");
-			printf("Frame Pointer (SP):  0x%08x\n", frameptr);
-    printf("R0  = 0x%08x\n", env->regs[0]);
-    printf("R1  = 0x%08x\n", env->regs[1]);
-    printf("R2  = 0x%08x\n", env->regs[2]);
-    printf("R3  = 0x%08x\n", env->regs[3]);
-    printf("R12 = 0x%08x\n", env->regs[12]);
-    printf("LR  = 0x%08x\n", env->regs[14]);
-    printf("PC  = 0x%08x\n", env->regs[15]);
-    printf("xPSR= 0x%08x\n", xpsr);
-#endif  
-}
 
         if (!pop_ok) {
             /*
