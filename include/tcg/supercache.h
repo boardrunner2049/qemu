@@ -85,4 +85,24 @@ static inline bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
 /* Return address of the TB epilogue (static tb_ret_addr), or NULL. */
 const void *tcg_target_tb_ret_addr(void);
 
+/*
+ * Supercache state for the profile writer (scp, qemu-sc-profile.patch).
+ * The loaded_* fields describe the header as it was read from disk on a
+ * reused cache, and are all zero for a new cache.  Returns false (and
+ * zeroes @info) when no supercache is configured.
+ */
+typedef struct TCGSupercacheInfo {
+    bool configured;
+    bool initialized;
+    bool flat;
+    bool reused;
+    uint64_t code_address;
+    uint64_t runtime_signature;
+    uint64_t loaded_record_count;
+    uint64_t loaded_header_checksum;
+    uint64_t loaded_max_end;
+} TCGSupercacheInfo;
+
+bool tcg_supercache_get_info(TCGSupercacheInfo *info);
+
 #endif

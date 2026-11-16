@@ -33,6 +33,7 @@
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
 #include "tcg/supercache.h"
+#include "accel/tcg/sc-profile.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -399,6 +400,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
+        if (unlikely(scp_active)) {
+            scp_lookup_miss();          /* P3 miss */
+        }
         return tcg_code_gen_epilogue;
     }
 
@@ -406,6 +410,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         log_cpu_exec(s.pc, cpu, tb);
     }
 
+    if (unlikely(scp_active)) {
+        scp_lookup_hit(cpu, tb, s.pc, GETPC());     /* P3 hit */
+    }
     return tb->tc.ptr;
 }
 
@@ -454,6 +461,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      */
     last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
     *tb_exit = ret & TB_EXIT_MASK;
+    if (unlikely(scp_active)) {
+        scp_return(last_tb, *tb_exit, ret);         /* P2 */
+    }
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
@@ -518,6 +528,10 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+
+    if (unlikely(scp_active)) {
+        scp_longjmp();                              /* P6 */
+    }
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
@@ -730,6 +744,9 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
         const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
         bql_lock();
+        if (unlikely(scp_active)) {
+            scp_note_exception();                   /* P5 */
+        }
         tcg_ops->do_interrupt(cpu);
         bql_unlock();
         cpu->exception_index = -1;
@@ -825,6 +842,9 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
              * and via longjmp via cpu_loop_exit.
              */
             if (tcg_ops->cpu_exec_interrupt(cpu, interrupt_request)) {
+                if (unlikely(scp_active)) {
+                    scp_note_irq();                 /* P4 */
+                }
                 if (!tcg_ops->need_replay_interrupt ||
                     tcg_ops->need_replay_interrupt(interrupt_request)) {
                     replay_interrupt();
@@ -980,9 +1000,15 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 last_tb = NULL;
             }
 #endif
-            /* See if we can patch the calling TB. */
-            if (last_tb) {
+            /*
+             * See if we can patch the calling TB.  Profile mode (scp) never
+             * chains, so that every TB entry is observed.
+             */
+            if (last_tb && likely(!scp_active)) {
                 tb_add_jump(last_tb, tb_exit, tb);
+            }
+            if (unlikely(scp_active)) {
+                scp_dispatch(cpu, tb, s.pc);                /* P1 */
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);

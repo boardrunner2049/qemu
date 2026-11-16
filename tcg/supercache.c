@@ -113,6 +113,7 @@ static struct {
     uint64_t flat_guest_base;
     uint64_t max_end;
     uint64_t loaded_max_end;
+    SupercacheHeader loaded_header;
     bool configured;
     bool initialized;
     bool flat;
@@ -645,6 +646,7 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
         load_records();
         flat_index_init();
         supercache.loaded_max_end = supercache.max_end;
+        supercache.loaded_header = disk_header;
     } else {
         write_header();
     }
@@ -1012,6 +1014,28 @@ bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
     return true;
 }
 
+bool tcg_supercache_get_info(TCGSupercacheInfo *info)
+{
+    memset(info, 0, sizeof(*info));
+    if (!supercache.configured) {
+        return false;
+    }
+    info->configured = true;
+    info->flat = supercache.flat;
+    if (supercache.initialized) {
+        info->initialized = true;
+        info->code_address = (uintptr_t)supercache.buffer;
+        info->runtime_signature = supercache.header.runtime_signature;
+        if (supercache.loaded_header.version) {
+            info->reused = true;
+            info->loaded_record_count = supercache.loaded_header.record_count;
+            info->loaded_header_checksum = supercache.loaded_header.checksum;
+            info->loaded_max_end = supercache.loaded_max_end;
+        }
+    }
+    return true;
+}
+
 #else /* CONFIG_LINUX && HOST_X86_64 */
 
 void tcg_supercache_configure(const char *path, bool flat, int splitwx,
@@ -1070,6 +1094,12 @@ TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr)
 
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
 {
+    return false;
+}
+
+bool tcg_supercache_get_info(TCGSupercacheInfo *info)
+{
+    memset(info, 0, sizeof(*info));
     return false;
 }
 
