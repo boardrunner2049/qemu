@@ -316,6 +316,12 @@ static void sync_cache(void)
     }
 }
 
+/* scc H1 needs to reject supercache-flat; see tcg/sc-capture.c. */
+bool tcg_supercache_flat_requested(void)
+{
+    return supercache.configured && supercache.flat;
+}
+
 void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads)
 {
@@ -687,6 +693,21 @@ void tcg_supercache_after_prologue(TCGContext *s)
     if (header_changed) {
         write_header();
     }
+    if (unlikely(scc_active)) {
+        /* scc H2: RUN_INFO (design 2.5.3) */
+        SccRunInfoArgs a = {
+            .buffer = supercache.buffer,
+            .code_size = supercache.header.code_size,
+            .prologue_end = supercache.header.prologue_end,
+            .runtime_signature = supercache.header.runtime_signature,
+            .record_count_at_load = supercache.header.record_count,
+            .loaded_max_end = supercache.loaded_max_end,
+            .tb_size = supercache.header.tb_size,
+            .host_page_size = supercache.header.host_page_size,
+            .target_page_bits = supercache.header.target_page_bits,
+        };
+        scc_run_info(s, tcg_target_tb_ret_addr(), &a);
+    }
 }
 
 void tcg_supercache_runtime_reset(void)
@@ -765,6 +786,11 @@ void tcg_supercache_record(TranslationBlock *tb, const void *end)
         error_report("supercache: cannot append translation: %s",
                      ret < 0 ? strerror(errno) : "short write");
         exit(EXIT_FAILURE);
+    }
+    if (unlikely(scc_active)) {
+        /* scc H17: TB chunk joined to the slot just written */
+        scc_tb_commit(tb, supercache.header.record_count, &record,
+                      sizeof(record), supercache.buffer);
     }
     supercache.header.record_count++;
     supercache.max_end = MAX(supercache.max_end, record.end_offset);

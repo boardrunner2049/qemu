@@ -30,6 +30,7 @@
 #include "exec/target_page.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-temp-internal.h"
+#include "tcg/sc-capture.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -2764,6 +2765,14 @@ static void gen_goto_ptr(void)
  */
 static void gen_goto_tb(DisasContext *s, int n, target_long diff)
 {
+#ifndef CONFIG_USER_ONLY
+    if (unlikely(scc_active)) {
+        /* scc H16: static guest destination of this exit */
+        scc_static_exit(n, s->pc_curr + diff,
+                        translator_use_goto_tb(&s->base, s->pc_curr + diff),
+                        s->base.num_insns - 1);
+    }
+#endif
     if (translator_use_goto_tb(&s->base, s->pc_curr + diff)) {
         /*
          * For pcrel, the pc must always be up-to-date on entry to

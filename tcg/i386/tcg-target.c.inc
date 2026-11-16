@@ -1092,19 +1092,29 @@ static void tcg_out_movi_int(TCGContext *s, TCGType type,
                              TCGReg ret, tcg_target_long arg)
 {
     tcg_target_long diff;
+    const tcg_insn_unit *scc_i0 = s->code_ptr;   /* scc H8 */
 
     if (arg == 0 && !s->carry_live) {
         tgen_arithr(s, ARITH_XOR, ret, ret);
+        if (unlikely(scc_in_tb)) {
+            scc_movi(s, scc_i0, NULL, SCC_ENC_XOR0, arg);
+        }
         return;
     }
     if (arg == (uint32_t)arg || type == TCG_TYPE_I32) {
         tcg_out_opc(s, OPC_MOVL_Iv + LOWREGMASK(ret), 0, ret, 0);
         tcg_out32(s, arg);
+        if (unlikely(scc_in_tb)) {
+            scc_movi(s, scc_i0, s->code_ptr - 4, SCC_ENC_IMM32_ZX, arg);
+        }
         return;
     }
     if (arg == (int32_t)arg) {
         tcg_out_modrm(s, OPC_MOVL_EvIz + P_REXW, 0, ret);
         tcg_out32(s, arg);
+        if (unlikely(scc_in_tb)) {
+            scc_movi(s, scc_i0, s->code_ptr - 4, SCC_ENC_IMM32_SX, arg);
+        }
         return;
     }
 
@@ -1114,11 +1124,17 @@ static void tcg_out_movi_int(TCGContext *s, TCGType type,
         tcg_out_opc(s, OPC_LEA | P_REXW, ret, 0, 0);
         tcg_out8(s, (LOWREGMASK(ret) << 3) | 5);
         tcg_out32(s, diff);
+        if (unlikely(scc_in_tb)) {
+            scc_movi(s, scc_i0, s->code_ptr - 4, SCC_ENC_RIPREL32, arg);
+        }
         return;
     }
 
     tcg_out_opc(s, OPC_MOVL_Iv + P_REXW + LOWREGMASK(ret), 0, ret, 0);
     tcg_out64(s, arg);
+    if (unlikely(scc_in_tb)) {
+        scc_movi(s, scc_i0, s->code_ptr - 8, SCC_ENC_IMM64, arg);
+    }
 }
 
 static void tcg_out_movi(TCGContext *s, TCGType type,
@@ -1506,6 +1522,7 @@ static void tcg_out_addi(TCGContext *s, int reg, tcg_target_long val)
 static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, bool small)
 {
     int32_t val, val1;
+    const tcg_insn_unit *scc_i0 = s->code_ptr;   /* scc H6 */
 
     if (l->has_value) {
         val = tcg_pcrel_diff(s, l->u.value_ptr);
@@ -1517,6 +1534,9 @@ static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, bool small)
                 tcg_out8(s, OPC_JCC_short + opc);
             }
             tcg_out8(s, val1);
+            if (unlikely(scc_in_tb)) {
+                scc_label_jump(s, scc_i0, s->code_ptr - 1, 1, opc, l);
+            }
         } else {
             tcg_debug_assert(!small);
             if (opc == -1) {
@@ -1525,6 +1545,9 @@ static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, bool small)
             } else {
                 tcg_out_opc(s, OPC_JCC_long + opc, 0, 0, 0);
                 tcg_out32(s, val - 6);
+            }
+            if (unlikely(scc_in_tb)) {
+                scc_label_jump(s, scc_i0, s->code_ptr - 4, 4, opc, l);
             }
         }
     } else if (small) {
@@ -1535,6 +1558,9 @@ static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, bool small)
         }
         tcg_out_reloc(s, s->code_ptr, R_386_PC8, l, -1);
         s->code_ptr += 1;
+        if (unlikely(scc_in_tb)) {
+            scc_label_jump(s, scc_i0, s->code_ptr - 1, 1, opc, l);
+        }
     } else {
         if (opc == -1) {
             tcg_out8(s, OPC_JMP_long);
@@ -1543,6 +1569,9 @@ static void tcg_out_jxx(TCGContext *s, int opc, TCGLabel *l, bool small)
         }
         tcg_out_reloc(s, s->code_ptr, R_386_PC32, l, -4);
         s->code_ptr += 4;
+        if (unlikely(scc_in_tb)) {
+            scc_label_jump(s, scc_i0, s->code_ptr - 4, 4, opc, l);
+        }
     }
 }
 
@@ -1938,10 +1967,14 @@ static const TCGOutOpMovcond outop_movcond = {
 static void tcg_out_branch(TCGContext *s, int call, const tcg_insn_unit *dest)
 {
     intptr_t disp = tcg_pcrel_diff(s, dest) - 5;
+    const tcg_insn_unit *scc_i0 = s->code_ptr;   /* scc H7 */
 
     if (disp == (int32_t)disp) {
         tcg_out_opc(s, call ? OPC_CALL_Jz : OPC_JMP_long, 0, 0, 0);
         tcg_out32(s, disp);
+        if (unlikely(scc_in_tb)) {
+            scc_branch(s, scc_i0, s->code_ptr - 4, call, SCC_ENC_REL32, dest);
+        }
     } else {
         /* rip-relative addressing into the constant pool.
            This is 6 + 8 = 14 bytes, as compared to using an
@@ -1951,6 +1984,10 @@ static void tcg_out_branch(TCGContext *s, int call, const tcg_insn_unit *dest)
         tcg_out8(s, (call ? EXT5_CALLN_Ev : EXT5_JMPN_Ev) << 3 | 5);
         new_pool_label(s, (uintptr_t)dest, R_386_PC32, s->code_ptr, -4);
         tcg_out32(s, 0);
+        if (unlikely(scc_in_tb)) {
+            scc_branch(s, scc_i0, s->code_ptr - 4, call,
+                       SCC_ENC_POOL_INDIRECT, dest);
+        }
     }
 }
 
@@ -2037,6 +2074,9 @@ static TCGReg ldst_ra_gen(TCGContext *s, const TCGLabelQemuLdst *l, int arg)
 {
     if (arg < 0) {
         arg = TCG_REG_RAX;
+    }
+    if (unlikely(scc_in_tb)) {
+        scc_tag_movi(SCC_SITE_MOVI_LDST_RA, 0);   /* scc H10 */
     }
     tcg_out_movi(s, TCG_TYPE_PTR, arg, (uintptr_t)l->raddr);
     return arg;
@@ -2630,9 +2670,18 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
 {
     /* Reuse the zeroing that exists for goto_ptr.  */
     if (a0 == 0) {
+        if (unlikely(scc_in_tb)) {
+            scc_tag_branch(SCC_SITE_EXIT_TB_EPI_JMP, 0);   /* scc H9 */
+        }
         tcg_out_jmp(s, tcg_code_gen_epilogue);
     } else {
+        if (unlikely(scc_in_tb)) {
+            scc_tag_movi(SCC_SITE_MOVI_EXIT_TB_PTR, a0 & 3);   /* scc H9 */
+        }
         tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_EAX, a0);
+        if (unlikely(scc_in_tb)) {
+            scc_tag_branch(SCC_SITE_EXIT_TB_RET_JMP, a0 & 3);
+        }
         tcg_out_jmp(s, tb_ret_addr);
     }
 }
@@ -2644,10 +2693,15 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
      * see if we need to add extra nops before jump
      */
     int gap = QEMU_ALIGN_PTR_UP(s->code_ptr + 1, 4) - s->code_ptr;
+    const tcg_insn_unit *scc_pad = s->code_ptr;   /* scc H11 */
+
     if (gap != 1) {
         tcg_out_nopn(s, gap - 1);
     }
     tcg_out8(s, OPC_JMP_long); /* jmp im */
+    if (unlikely(scc_in_tb)) {
+        scc_goto_tb(s, which, scc_pad, s->code_ptr);
+    }
     set_jmp_insn_offset(s, which);
     tcg_out32(s, 0);
     set_jmp_reset_offset(s, which);
@@ -2656,6 +2710,9 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
 static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
 {
     /* Jump to the given host address (could be epilogue) */
+    if (unlikely(scc_in_tb)) {
+        scc_goto_ptr(s, s->code_ptr, a0);   /* scc H12 */
+    }
     tcg_out_modrm(s, OPC_GRP5, EXT5_JMPN_Ev, a0);
 }
 

@@ -58,6 +58,7 @@
 #include "tcg-internal.h"
 #include "tcg/perf.h"
 #include "tcg-has.h"
+#include "tcg/sc-capture.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/guest-base.h"
 #endif
@@ -773,10 +774,17 @@ static int tcg_out_ldst_finalize(TCGContext *s)
 
     /* qemu_ld/st slow paths */
     QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
+        if (unlikely(scc_in_tb)) {
+            scc_ldst_begin(s, lb->is_ld, lb->oi, lb->label_ptr[0],
+                           lb->label_ptr[1], lb->raddr);
+        }
         if (lb->is_ld
             ? !tcg_out_qemu_ld_slow_path(s, lb)
             : !tcg_out_qemu_st_slow_path(s, lb)) {
             return -2;
+        }
+        if (unlikely(scc_in_tb)) {
+            scc_ldst_end(s);
         }
 
         /*
@@ -788,6 +796,9 @@ static int tcg_out_ldst_finalize(TCGContext *s)
         if (unlikely((void *)s->code_ptr > s->code_gen_highwater)) {
             return -1;
         }
+    }
+    if (unlikely(scc_in_tb)) {
+        scc_ldst_done(s);
     }
     return 0;
 }
@@ -810,6 +821,9 @@ static int tcg_out_pool_finalize(TCGContext *s)
                          sizeof(tcg_target_ulong) * p->nlong);
     tcg_out_nop_fill(s->code_ptr, (tcg_insn_unit *)a - s->code_ptr);
     s->data_gen_ptr = a;
+    if (unlikely(scc_in_tb)) {
+        scc_pool_start(s, a);
+    }
 
     for (; p != NULL; p = p->next) {
         size_t size = sizeof(tcg_target_ulong) * p->nlong;
@@ -827,6 +841,10 @@ static int tcg_out_pool_finalize(TCGContext *s)
         value = (uintptr_t)tcg_splitwx_to_rx(a) - size;
         if (!patch_reloc(p->label, p->rtype, value, p->addend)) {
             return -2;
+        }
+        if (unlikely(scc_in_tb)) {
+            scc_pool_entry(s, p->label, p->rtype, p->addend, p->nlong,
+                           p->data, value);
         }
     }
 
@@ -1974,6 +1992,9 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    if (unlikely(scc_active)) {
+        scc_translate_begin();
+    }
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
 
@@ -6193,6 +6214,9 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
         load_arg_ref(s, 0, ts->mem_base->reg, ts->mem_offset, &allocated_regs);
     }
 
+    if (unlikely(scc_in_tb)) {
+        scc_helper(info, tcg_call_func(op));
+    }
     tcg_out_call(s, tcg_call_func(op), info);
 
     /* Assign output registers and emit moves if needed.  */
@@ -6937,6 +6961,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->code_buf = tcg_splitwx_to_rw(tb->tc.ptr);
     s->code_ptr = s->code_buf;
     s->data_gen_ptr = NULL;
+    if (unlikely(scc_active)) {
+        scc_tb_begin(s, tb, pc_start);
+    }
 
     QSIMPLEQ_INIT(&s->ldst_labels);
     s->pool_labels = NULL;
@@ -6951,6 +6978,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
 
+        if (unlikely(scc_in_tb)) {
+            scc_op(s, op, num_insns);
+        }
         switch (opc) {
         case INDEX_op_extrl_i64_i32:
             assert(TCG_TARGET_REG_BITS == 64);
@@ -7056,6 +7086,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     }
     if (!tcg_resolve_relocs(s)) {
         return -2;
+    }
+    if (unlikely(scc_in_tb)) {
+        scc_tb_end(s, tb, tcg_current_code_size(s));
     }
 
 #ifndef CONFIG_TCG_INTERPRETER
