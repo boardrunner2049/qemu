@@ -1118,6 +1118,17 @@ typedef struct TCGOutOpSubtract {
 
 #include "tcg-target.c.inc"
 
+#include "tcg/supercache.h"
+
+const void *tcg_target_tb_ret_addr(void)
+{
+#ifdef HOST_X86_64
+    return tb_ret_addr;
+#else
+    return NULL;
+#endif
+}
+
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -

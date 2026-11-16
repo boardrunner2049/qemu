@@ -11,6 +11,8 @@ typedef struct TCGContext TCGContext;
 void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads);
 bool tcg_supercache_enabled(void);
+void *tcg_supercache_buffer(void);
+uint64_t tcg_supercache_loaded_max_end(void);
 int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
                                      Error **errp);
 void tcg_supercache_after_prologue(TCGContext *s);
@@ -30,6 +32,16 @@ static inline void tcg_supercache_configure(const char *path, bool flat,
 static inline bool tcg_supercache_enabled(void)
 {
     return false;
+}
+
+static inline void *tcg_supercache_buffer(void)
+{
+    return NULL;
+}
+
+static inline uint64_t tcg_supercache_loaded_max_end(void)
+{
+    return 0;
 }
 
 static inline int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
@@ -69,5 +81,8 @@ static inline bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
     return false;
 }
 #endif
+
+/* Return address of the TB epilogue (static tb_ret_addr), or NULL. */
+const void *tcg_target_tb_ret_addr(void);
 
 #endif

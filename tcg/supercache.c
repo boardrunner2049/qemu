@@ -9,6 +9,8 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "tcg/supercache.h"
+#include "tcg/sc-capture.h"
+#include "accel/tcg/sc-profile.h"
 
 #if defined(CONFIG_LINUX) && defined(HOST_X86_64)
 
@@ -110,6 +112,7 @@ static struct {
     uint32_t flat_page_count;
     uint64_t flat_guest_base;
     uint64_t max_end;
+    uint64_t loaded_max_end;
     bool configured;
     bool initialized;
     bool flat;
@@ -317,6 +320,9 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads)
 {
     if (!path) {
+        /* Let capture/profile reject their switch without a supercache. */
+        scc_configure_from_env();
+        scp_configure_from_env();
         return;
     }
     if (splitwx > 0) {
@@ -330,11 +336,23 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
     supercache.path = g_canonicalize_filename(path, NULL);
     supercache.configured = true;
     supercache.flat = flat;
+    scc_configure_from_env();
+    scp_configure_from_env();
 }
 
 bool tcg_supercache_enabled(void)
 {
     return supercache.configured;
+}
+
+void *tcg_supercache_buffer(void)
+{
+    return supercache.initialized ? supercache.buffer : NULL;
+}
+
+uint64_t tcg_supercache_loaded_max_end(void)
+{
+    return supercache.initialized ? supercache.loaded_max_end : 0;
 }
 
 static void *map_cache(size_t size, uintptr_t address, Error **errp)
@@ -620,6 +638,7 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
     if (reuse) {
         load_records();
         flat_index_init();
+        supercache.loaded_max_end = supercache.max_end;
     } else {
         write_header();
     }
@@ -982,6 +1001,16 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
 bool tcg_supercache_enabled(void)
 {
     return false;
+}
+
+void *tcg_supercache_buffer(void)
+{
+    return NULL;
+}
+
+uint64_t tcg_supercache_loaded_max_end(void)
+{
+    return 0;
 }
 
 int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
