@@ -260,6 +260,10 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     s->one_insn_per_tb = value;
     /* Set the global also: this changes the behaviour */
     qatomic_set(&one_insn_per_tb, value);
+    if (value) {
+        /* supercache v6 Q9: forbid arming; disarm in exclusive context */
+        tcg_supercache_v6_one_insn_per_tb();
+    }
 }
 
 static int tcg_gdbstub_supported_sstep_flags(void)

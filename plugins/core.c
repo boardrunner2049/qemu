@@ -12,6 +12,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "tcg/supercache-v6.h"
 #include "qemu/lockable.h"
 #include "qemu/option.h"
 #include "qemu/plugin.h"
@@ -256,6 +257,9 @@ static void plugin_grow_scoreboards__locked(CPUState *cpu)
         plugin.scoreboard_alloc_size = scoreboard_size;
         /* force all tb to be flushed, as scoreboard pointers were changed. */
         tb_flush(cpu);
+#ifndef CONFIG_USER_ONLY
+        tcg_supercache_v6_forbid();     /* supercache v6 Q11 */
+#endif
     }
     end_exclusive();
 }

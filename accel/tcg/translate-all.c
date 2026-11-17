@@ -181,6 +181,9 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
     if (insns_left < 0) {
         return;
     }
+    if (unlikely(tcg_sc6_stats_active)) {
+        tcg_supercache_v6_note_restore(tb);         /* v6 Q10 */
+    }
 
     if (tb_cflags(tb) & CF_USE_ICOUNT) {
         assert(icount_enabled());

@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/supercache-v6.h"
 #include "qemu/error-report.h"
 #include "qemu/config-file.h"
 #include "qemu/help_option.h"
@@ -379,6 +380,7 @@ static void plugin_flush_destroy(CPUState *cpu, run_on_cpu_data arg)
 
     g_assert(cpu_in_exclusive_context(cpu));
     tb_flush(cpu);
+    tcg_supercache_v6_forbid();         /* supercache v6 Q11 */
     plugin_reset_destroy(data);
 }
 

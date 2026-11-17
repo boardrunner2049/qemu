@@ -464,6 +464,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     if (unlikely(scp_active)) {
         scp_return(last_tb, *tb_exit, ret);         /* P2 */
     }
+    if (unlikely(tcg_sc6_stats_active)) {
+        tcg_supercache_v6_note_exit(last_tb, *tb_exit);   /* v6 Q10 */
+    }
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 

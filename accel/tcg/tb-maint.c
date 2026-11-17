@@ -859,6 +859,23 @@ void tb_reset_jump(TranslationBlock *tb, int n)
     tb_set_jmp_target(tb, n, addr);
 }
 
+/*
+ * Unlink the outgoing jump @n of @tb (supercache v6, Q8): remove it from
+ * the destination's incoming list, point it back at its reset path, and
+ * clear jmp_dest[n] so that the main loop may chain it again after a fresh
+ * lookup.  Unlike tb_remove_from_jmp_list() alone, this also resets the
+ * jump itself.  Called on the vCPU thread or in the exclusive context.
+ */
+void tb_unlink_jump(TranslationBlock *tb, int n)
+{
+    if (tb->jmp_reset_offset[n] == TB_JMP_OFFSET_INVALID) {
+        return;
+    }
+    tb_remove_from_jmp_list(tb, n);
+    tb_reset_jump(tb, n);
+    qatomic_set(&tb->jmp_dest[n], (uintptr_t)NULL);
+}
+
 /* remove any jumps to the TB */
 static inline void tb_jmp_unlink(TranslationBlock *dest)
 {

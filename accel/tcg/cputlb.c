@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/supercache.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-ops.h"
@@ -393,6 +394,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
     tcg_flush_jmp_cache(cpu);
+    tcg_supercache_mapping_changed(cpu);    /* supercache v6 Q7 */
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -553,6 +555,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
      */
     tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
     tb_jmp_cache_clear_page(cpu, addr);
+    tcg_supercache_mapping_changed(cpu);    /* supercache v6 Q7 */
 }
 
 /**
@@ -743,6 +746,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      */
     if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
         tcg_flush_jmp_cache(cpu);
+        tcg_supercache_mapping_changed(cpu);    /* supercache v6 Q7 */
         return;
     }
 
@@ -755,6 +759,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
         tb_jmp_cache_clear_page(cpu, d.addr);
         d.addr += TARGET_PAGE_SIZE;
     }
+    tcg_supercache_mapping_changed(cpu);    /* supercache v6 Q7 */
 }
 
 static void tlb_flush_range_by_mmuidx_async_1(CPUState *cpu,

@@ -4,6 +4,7 @@
 
 #include "exec/translation-block.h"
 #include "accel/tcg/tb-cpu-state.h"
+#include "tcg/supercache-v6.h"
 
 typedef struct TCGContext TCGContext;
 
@@ -22,6 +23,19 @@ TranslationBlock *tcg_supercache_lookup(CPUState *cpu, TCGTBCPUState state,
                                         tb_page_addr_t phys_pc);
 TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr);
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb);
+
+/*
+ * .sc v6 loader (WP22, design/B3-B4-design.md §5.5-5.8).
+ * tcg_supercache_mapping_changed: end of each vCPU TLB-flush worker (Q7).
+ * tcg_supercache_v6_one_insn_per_tb: one-insn-per-tb was set (Q9).
+ * tcg_supercache_v6_note_exit/_restore: QEMU_SC_V6_STATS counters (Q10),
+ * called only while tcg_sc6_stats_active.
+ */
+extern bool tcg_sc6_stats_active;
+void tcg_supercache_mapping_changed(CPUState *cpu);
+void tcg_supercache_v6_one_insn_per_tb(void);
+void tcg_supercache_v6_note_exit(TranslationBlock *tb, int tb_exit);
+void tcg_supercache_v6_note_restore(TranslationBlock *tb);
 #else
 static inline void tcg_supercache_configure(const char *path, bool flat,
                                             int splitwx,
@@ -79,6 +93,24 @@ tcg_supercache_host_lookup(uintptr_t tc_ptr)
 static inline bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
 {
     return false;
+}
+
+#define tcg_sc6_stats_active false
+static inline void tcg_supercache_mapping_changed(CPUState *cpu)
+{
+}
+
+static inline void tcg_supercache_v6_one_insn_per_tb(void)
+{
+}
+
+static inline void tcg_supercache_v6_note_exit(TranslationBlock *tb,
+                                               int tb_exit)
+{
+}
+
+static inline void tcg_supercache_v6_note_restore(TranslationBlock *tb)
+{
 }
 #endif
 

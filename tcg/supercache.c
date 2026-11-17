@@ -25,11 +25,15 @@
 #include "system/memory.h"
 #include "tcg/tcg.h"
 #include "accel/tcg/internal-common.h"
+#include "accel/tcg/probe.h"
+#include "qemu/bitops.h"
+#include "qemu/target-info.h"
 
 #include <sys/file.h>
 
 #define SUPERCACHE_MAGIC          "QSCACHE1"
 #define SUPERCACHE_VERSION        5
+#define SC6_VERSION               6       /* .sc v6 (WP22) */
 #define SUPERCACHE_CODE_OFFSET    (64 * KiB)
 #define SUPERCACHE_RECORD_COMMIT  0x53435231U
 #define SUPERCACHE_FNV_OFFSET     UINT64_C(1469598103934665603)
@@ -317,6 +321,8 @@ static void sync_cache(void)
     }
 }
 
+static void sc6_configure_from_env(void);
+
 /* scc H1 needs to reject supercache-flat; see tcg/sc-capture.c. */
 bool tcg_supercache_flat_requested(void)
 {
@@ -343,6 +349,7 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
     supercache.path = g_canonicalize_filename(path, NULL);
     supercache.configured = true;
     supercache.flat = flat;
+    sc6_configure_from_env();
     scc_configure_from_env();
     scp_configure_from_env();
 }
@@ -390,7 +397,8 @@ static bool valid_header(const SupercacheHeader *header, size_t size,
                          uint64_t signature)
 {
     return memcmp(header->magic, SUPERCACHE_MAGIC, 8) == 0 &&
-           header->version == SUPERCACHE_VERSION &&
+           (header->version == SUPERCACHE_VERSION ||
+            header->version == SC6_VERSION) &&
            header->header_size == sizeof(*header) &&
            header->checksum == header_checksum(header) &&
            header->code_size == size &&
@@ -586,6 +594,1076 @@ static bool pwrite_full(int fd, const void *buffer, size_t size, off_t offset)
     return true;
 }
 
+/*
+ * .sc v6 loader (design/B3-B4-design.md §5, WP22, Q1-Q11).
+ *
+ * A v6 file is a v5 file whose header has version 6 and whose `reserved`
+ * word holds feature flags; the extension table lives at file offset 0x100,
+ * inside the [80, 0x10000) gap that no v5 path reads or writes.  It names
+ * variants (relocated clones C' of a general record C, never in the QHT),
+ * guarded slots (registered goto_tb slots of a grown record R whose stub
+ * S checks the whole lookup key) and links (SPEC slot -> variant).
+ *
+ * The loader validates the table (fail loud, before any guest instruction),
+ * arms SPEC links when both members are activated in the same tb_flush
+ * epoch, and unlinks every guarded slot and every built variant's slots on
+ * every TLB flush.  Nothing here touches generated code paths of v5 files.
+ */
+
+#define SC6_EXT_OFFSET           0x100
+#define SC6_ARRAYS_OFFSET        0x140
+#define SC6_EXT_MAGIC            "QSCX6EXT"
+#define SC6_FEAT_EXT_TABLE       (1u << 0)
+#define SC6_FEAT_VARIANTS        (1u << 1)
+#define SC6_FEAT_GUARDED_SLOTS   (1u << 2)
+#define SC6_FEAT_REWRITTEN       (1u << 3)
+#define SC6_KNOWN_FEATURES       0xfu
+#define SC6_VARIANT_FACTS        (1u << 0)
+#define SC6_SLOT_GENERAL         1
+#define SC6_SLOT_SPEC            2
+#define SC6_EXIT_RETURN          1
+#define SC6_EXIT_STATIC          2
+#define SC6_MAX_DISARMS          64
+#define SC6_NONE                 UINT32_MAX
+
+typedef struct Sc6ExtHeader {
+    char magic[8];
+    uint32_t ext_version;
+    uint32_t ext_header_size;
+    uint32_t n_variants;
+    uint32_t n_slots;
+    uint32_t n_links;
+    uint16_t variant_entry_size;
+    uint16_t slot_entry_size;
+    uint16_t link_entry_size;
+    uint16_t reserved0;
+    uint32_t reserved1;
+    uint64_t variants_max_end;
+    uint8_t artifact_id8[8];
+    uint64_t checksum;
+} Sc6ExtHeader;
+
+typedef struct Sc6VariantEntry {
+    uint64_t general_tb_offset;
+    uint64_t tb_offset;
+    uint64_t tc_offset;
+    uint64_t tc_size;
+    uint64_t end_offset;
+    uint64_t code_fnv64;
+    uint32_t variant_id;
+    uint32_t flags;
+    uint64_t reserved;
+} Sc6VariantEntry;
+
+typedef struct Sc6SlotEntry {
+    uint64_t src_tb_offset;
+    uint8_t slot_n;
+    uint8_t kind;
+    uint8_t exit_class;
+    uint8_t reserved;
+    uint32_t target_vaddr;
+    uint32_t guard_off;
+    uint32_t guard_len;
+    uint64_t guard_fnv64;
+} Sc6SlotEntry;
+
+typedef struct Sc6LinkEntry {
+    uint32_t slot_index;
+    uint32_t variant_index;
+    uint64_t reserved;
+} Sc6LinkEntry;
+
+QEMU_BUILD_BUG_ON(sizeof(Sc6ExtHeader) != 64);
+QEMU_BUILD_BUG_ON(offsetof(Sc6ExtHeader, checksum) != 56);
+QEMU_BUILD_BUG_ON(sizeof(Sc6VariantEntry) != 64);
+QEMU_BUILD_BUG_ON(sizeof(Sc6SlotEntry) != 32);
+QEMU_BUILD_BUG_ON(offsetof(Sc6SlotEntry, guard_fnv64) != 24);
+QEMU_BUILD_BUG_ON(sizeof(Sc6LinkEntry) != 16);
+QEMU_BUILD_BUG_ON(offsetof(SupercacheHeader, reserved) != 68);
+
+typedef struct Sc6Variant {
+    Sc6VariantEntry e;
+    uint32_t general;           /* loaded entry index of C */
+    uint32_t link;              /* link index */
+    TranslationBlock *built;    /* C' struct, built in this flush epoch */
+} Sc6Variant;
+
+typedef struct Sc6Slot {
+    Sc6SlotEntry e;
+    uint32_t src;               /* loaded entry index of R */
+    uint32_t link;              /* link index (SPEC) or SC6_NONE */
+} Sc6Slot;
+
+typedef struct Sc6Link {
+    uint32_t slot;
+    uint32_t variant;
+    bool armed;
+    bool disarmed_epoch;
+} Sc6Link;
+
+enum {
+    SC6_REFUSE_FORBIDDEN,
+    SC6_REFUSE_PROFILE,
+    SC6_REFUSE_ONE_INSN,
+    SC6_REFUSE_NOCHAIN,
+    SC6_REFUSE_SINGLESTEP,
+    SC6_REFUSE_BREAKPOINTS,
+    SC6_REFUSE_WATCHPOINTS,
+    SC6_REFUSE_INVALID,
+    SC6_REFUSE_TWO_PAGE,
+    SC6_REFUSE_MMU_IDX,
+    SC6_REFUSE_PROBE_NO_HOST,
+    SC6_REFUSE_PROBE_PAGE_SIZE,
+    SC6_REFUSE_PROBE_MISMATCH,
+    SC6_REFUSE_BUSY,
+    SC6_REFUSE__COUNT,
+};
+
+static const char *const sc6_refuse_names[SC6_REFUSE__COUNT] = {
+    [SC6_REFUSE_FORBIDDEN] = "forbidden",
+    [SC6_REFUSE_PROFILE] = "profile_mode",
+    [SC6_REFUSE_ONE_INSN] = "one_insn_per_tb",
+    [SC6_REFUSE_NOCHAIN] = "nochain",
+    [SC6_REFUSE_SINGLESTEP] = "singlestep",
+    [SC6_REFUSE_BREAKPOINTS] = "breakpoints",
+    [SC6_REFUSE_WATCHPOINTS] = "watchpoints",
+    [SC6_REFUSE_INVALID] = "member_invalid",
+    [SC6_REFUSE_TWO_PAGE] = "two_page_target",
+    [SC6_REFUSE_MMU_IDX] = "mmu_idx",
+    [SC6_REFUSE_PROBE_NO_HOST] = "probe_no_host",
+    [SC6_REFUSE_PROBE_PAGE_SIZE] = "probe_page_size",
+    [SC6_REFUSE_PROBE_MISMATCH] = "probe_mismatch",
+    [SC6_REFUSE_BUSY] = "slot_busy",
+};
+
+enum {
+    SC6_FORBID_NONE,
+    SC6_FORBID_ONE_INSN,
+    SC6_FORBID_PLUGIN,
+    SC6_FORBID_TLB_BUDGET,
+};
+
+static const char *const sc6_forbid_names[] = {
+    [SC6_FORBID_NONE] = "none",
+    [SC6_FORBID_ONE_INSN] = "one_insn_per_tb",
+    [SC6_FORBID_PLUGIN] = "plugin_reset",
+    [SC6_FORBID_TLB_BUDGET] = "tlb_disarm_budget",
+};
+
+/* Set once QEMU_SC_V6_STATS was accepted; read by cpu-exec/translate-all. */
+bool tcg_sc6_stats_active;
+
+static struct {
+    bool loaded;
+    bool forbidden;             /* qatomic: written by the monitor thread */
+    int forbid_reason;          /* qatomic */
+    uint32_t features;
+    uint8_t artifact_id8[8];
+    uint32_t n_variants, n_slots, n_links;
+    Sc6Variant *variants;
+    Sc6Slot *slots;
+    Sc6Link *links;
+    uint32_t n_entries;         /* records loaded from the file */
+    TranslationBlock **live;    /* per loaded entry: activated TB, or NULL */
+    uint8_t *role;              /* per loaded entry: SC6_ROLE_* */
+    uint32_t disarms;
+    char *stats_path;
+    struct {
+        int64_t ext_load_ns;
+        uint64_t activations;
+        uint64_t armed;
+        uint64_t refused[SC6_REFUSE__COUNT];
+        uint64_t variants_built;
+        uint64_t disarm_tlb_events;
+        uint64_t disarm_tlb_links;
+        uint64_t tlb_hook_calls;
+        uint64_t disarm_flush_links;
+        uint64_t flush_resets;
+        uint64_t disarm_forbid_events;
+        uint64_t disarm_forbid_links;
+        uint64_t forbid_requests;
+        uint64_t slots_unlinked;
+        uint64_t variant_slots_unlinked;
+        uint64_t variant_entry_exits;
+        uint64_t variant_exits;
+        uint64_t variant_restores;
+        uint64_t invariant_checks;
+        uint64_t invariant_violations;
+    } st;
+} sc6;
+
+#define SC6_ROLE_SRC      1     /* R of some guarded slot */
+#define SC6_ROLE_GENERAL  2     /* C of some variant */
+
+static G_NORETURN G_GNUC_PRINTF(1, 2) void sc6_die(const char *fmt, ...)
+{
+    va_list ap;
+    g_autofree char *reason = NULL;
+
+    va_start(ap, fmt);
+    reason = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    error_report("supercache: invalid v6 extension: %s", reason);
+    exit(EXIT_FAILURE);
+}
+
+/* First failing check of valid_header(), for the "discarding" warning. */
+static const char *header_problem(const SupercacheHeader *header, size_t size,
+                                  uint64_t signature)
+{
+    if (header->header_size != sizeof(*header)) {
+        return "header_size";
+    }
+    if (header->checksum != header_checksum(header)) {
+        return "header checksum";
+    }
+    if (header->code_size != size) {
+        return "code_size";
+    }
+    if (header->runtime_signature != signature) {
+        return "runtime signature";
+    }
+    if (header->host_page_size != qemu_real_host_page_size()) {
+        return "host page size";
+    }
+    if (header->target_page_bits != TARGET_PAGE_BITS) {
+        return "target page bits";
+    }
+    if (header->tb_size != sizeof(TranslationBlock)) {
+        return "tb_size";
+    }
+    return "unknown";
+}
+
+static int sc6_cmp_offset(const void *a, const void *b)
+{
+    const SupercacheEntry *e = supercache.entries;
+    uint64_t x = e[*(const uint32_t *)a].record.tb_offset;
+    uint64_t y = e[*(const uint32_t *)b].record.tb_offset;
+
+    return x < y ? -1 : x > y;
+}
+
+/* Q3: loaded entry index whose record has @tb_offset, or SC6_NONE. */
+static uint32_t sc6_find(const uint32_t *order, uint32_t n, uint64_t tb_offset)
+{
+    uint32_t lo = 0, hi = n;
+
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        uint64_t v = supercache.entries[order[mid]].record.tb_offset;
+
+        if (v == tb_offset) {
+            return order[mid];
+        }
+        if (v < tb_offset) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return SC6_NONE;
+}
+
+static bool sc6_ranges_overlap(uint64_t a0, uint64_t a1,
+                               uint64_t b0, uint64_t b1)
+{
+    return a0 < b1 && b0 < a1;
+}
+
+/*
+ * Q2: parse and validate the extension table (design §5.3, §5.4).  Called
+ * in the reuse branch of tcg_supercache_alloc_code_buffer() after
+ * load_records() and before loaded_max_end is set.  Every failure exits.
+ * The two code hashes are checked later, after the code pread (Q4).
+ */
+static void sc6_load_ext(void)
+{
+    const SupercacheHeader *h = &supercache.header;
+    int64_t t0 = g_get_monotonic_time();
+    Sc6ExtHeader x;
+    g_autofree uint8_t *arrays = NULL;
+    g_autofree uint32_t *order = NULL;
+    uint64_t arrays_size, hash, max_end = 0;
+    uint64_t floor, limit;
+    uint32_t n = supercache.entry_count;
+    const size_t tb_struct = ROUND_UP(sizeof(TranslationBlock), 64);
+
+    if (h->reserved & ~SC6_KNOWN_FEATURES) {
+        sc6_die("unknown feature bits 0x%" PRIx32,
+                h->reserved & ~SC6_KNOWN_FEATURES);
+    }
+    if (!(h->reserved & SC6_FEAT_EXT_TABLE)) {
+        sc6_die("feature EXT_TABLE clear");
+    }
+    if (supercache.flat) {
+        sc6_die("v6 needs normal mode");
+    }
+    if (strcmp(target_name(), "arm") != 0) {
+        sc6_die("v6 needs the arm target");
+    }
+    if (!pread_full(supercache.fd, &x, sizeof(x), SC6_EXT_OFFSET)) {
+        sc6_die("cannot read the extension header");
+    }
+    if (memcmp(x.magic, SC6_EXT_MAGIC, 8) != 0) {
+        sc6_die("bad ext magic");
+    }
+    if (x.ext_version != 1) {
+        sc6_die("bad ext_version %" PRIu32, x.ext_version);
+    }
+    if (x.ext_header_size != sizeof(x)) {
+        sc6_die("bad ext_header_size %" PRIu32, x.ext_header_size);
+    }
+    if (x.variant_entry_size != sizeof(Sc6VariantEntry) ||
+        x.slot_entry_size != sizeof(Sc6SlotEntry) ||
+        x.link_entry_size != sizeof(Sc6LinkEntry)) {
+        sc6_die("bad entry sizes %u/%u/%u", x.variant_entry_size,
+                x.slot_entry_size, x.link_entry_size);
+    }
+    if (x.reserved0 || x.reserved1) {
+        sc6_die("reserved header fields not zero");
+    }
+    arrays_size = (uint64_t)x.n_variants * sizeof(Sc6VariantEntry) +
+                  (uint64_t)x.n_slots * sizeof(Sc6SlotEntry) +
+                  (uint64_t)x.n_links * sizeof(Sc6LinkEntry);
+    if (SC6_ARRAYS_OFFSET + arrays_size > SUPERCACHE_CODE_OFFSET) {
+        sc6_die("ext table too large");
+    }
+    arrays = g_malloc0(arrays_size + 1);
+    if (arrays_size &&
+        !pread_full(supercache.fd, arrays, arrays_size, SC6_ARRAYS_OFFSET)) {
+        sc6_die("cannot read the extension arrays");
+    }
+    hash = hash_bytes(SUPERCACHE_FNV_OFFSET, &x,
+                      offsetof(Sc6ExtHeader, checksum));
+    hash = hash_bytes(hash, arrays, arrays_size);
+    if (hash != x.checksum) {
+        sc6_die("ext checksum mismatch");
+    }
+    if (!!(h->reserved & SC6_FEAT_VARIANTS) != !!x.n_variants) {
+        sc6_die("feature VARIANTS disagrees with n_variants %" PRIu32,
+                x.n_variants);
+    }
+    if (!!(h->reserved & SC6_FEAT_GUARDED_SLOTS) != !!x.n_slots) {
+        sc6_die("feature GUARDED_SLOTS disagrees with n_slots %" PRIu32,
+                x.n_slots);
+    }
+    memcpy(sc6.artifact_id8, x.artifact_id8, 8);
+    if (!ldq_he_p(sc6.artifact_id8)) {
+        sc6_die("artifact id is zero");
+    }
+
+    /* Q3: tb_offset -> loaded entry index (unique among valid records). */
+    order = g_new(uint32_t, n + 1);
+    for (uint32_t i = 0; i < n; i++) {
+        order[i] = i;
+    }
+    qsort(order, n, sizeof(*order), sc6_cmp_offset);
+    for (uint32_t i = 1; i < n; i++) {
+        uint64_t a = supercache.entries[order[i - 1]].record.tb_offset;
+
+        if (a == supercache.entries[order[i]].record.tb_offset) {
+            sc6_die("duplicate record tb_offset 0x%" PRIx64, a);
+        }
+    }
+
+    sc6.n_entries = n;
+    sc6.n_variants = x.n_variants;
+    sc6.n_slots = x.n_slots;
+    sc6.n_links = x.n_links;
+    sc6.variants = g_new0(Sc6Variant, x.n_variants + 1);
+    sc6.slots = g_new0(Sc6Slot, x.n_slots + 1);
+    sc6.links = g_new0(Sc6Link, x.n_links + 1);
+    sc6.live = g_new0(TranslationBlock *, n + 1);
+    sc6.role = g_new0(uint8_t, n + 1);
+    sc6.features = h->reserved;
+
+    floor = ROUND_UP(h->prologue_end, 64);
+    limit = supercache.size - qemu_real_host_page_size() - 1024;
+
+    for (uint32_t i = 0; i < x.n_variants; i++) {
+        Sc6Variant *v = &sc6.variants[i];
+        const SupercacheRecord *c;
+
+        memcpy(&v->e, arrays + i * sizeof(Sc6VariantEntry), sizeof(v->e));
+        v->link = SC6_NONE;
+        v->general = sc6_find(order, n, v->e.general_tb_offset);
+        if (v->general == SC6_NONE) {
+            sc6_die("variant %u: general_tb_offset 0x%" PRIx64
+                    " names no valid record", i, v->e.general_tb_offset);
+        }
+        c = &supercache.entries[v->general].record;
+        if (v->e.variant_id != i) {
+            sc6_die("variant %u: variant_id %" PRIu32 " is not dense",
+                    i, v->e.variant_id);
+        }
+        if (v->e.flags & ~SC6_VARIANT_FACTS) {
+            sc6_die("variant %u: unknown flags 0x%" PRIx32, i, v->e.flags);
+        }
+        if (v->e.reserved) {
+            sc6_die("variant %u: reserved not zero", i);
+        }
+        if (v->e.tb_offset % 64) {
+            sc6_die("variant %u: tb_offset 0x%" PRIx64 " not 64-aligned",
+                    i, v->e.tb_offset);
+        }
+        if (v->e.tc_offset < v->e.tb_offset ||
+            v->e.tc_offset - v->e.tb_offset != tb_struct) {
+            sc6_die("variant %u: tc_offset - tb_offset != %zu", i, tb_struct);
+        }
+        if (v->e.tc_size != c->tc_size) {
+            sc6_die("variant %u: tc_size 0x%" PRIx64 " != C tc_size 0x%"
+                    PRIx64, i, v->e.tc_size, c->tc_size);
+        }
+        if (v->e.end_offset != v->e.tc_offset +
+                               (c->end_offset - c->tc_offset)) {
+            sc6_die("variant %u: end_offset does not match C's extent", i);
+        }
+        if (v->e.tb_offset < floor) {
+            sc6_die("variant %u: below the prologue", i);
+        }
+        if (v->e.end_offset >= limit) {
+            sc6_die("variant %u: end_offset 0x%" PRIx64 " out of range",
+                    i, v->e.end_offset);
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            const SupercacheRecord *r = &supercache.entries[k].record;
+
+            if (sc6_ranges_overlap(v->e.tb_offset, v->e.end_offset,
+                                   r->tb_offset, r->end_offset)) {
+                sc6_die("variant %u: overlaps record at tb_offset 0x%"
+                        PRIx64, i, r->tb_offset);
+            }
+        }
+        for (uint32_t k = 0; k < i; k++) {
+            if (sc6_ranges_overlap(v->e.tb_offset, v->e.end_offset,
+                                   sc6.variants[k].e.tb_offset,
+                                   sc6.variants[k].e.end_offset)) {
+                sc6_die("variant %u: overlaps variant %u", i, k);
+            }
+        }
+        max_end = MAX(max_end, v->e.end_offset);
+        sc6.role[v->general] |= SC6_ROLE_GENERAL;
+    }
+    if (x.variants_max_end != max_end) {
+        sc6_die("variants_max_end 0x%" PRIx64 " != 0x%" PRIx64,
+                x.variants_max_end, max_end);
+    }
+
+    for (uint32_t i = 0; i < x.n_slots; i++) {
+        Sc6Slot *s = &sc6.slots[i];
+        const SupercacheRecord *r;
+        uint32_t n_slot, jmp, rst, g_end;
+
+        memcpy(&s->e, arrays + x.n_variants * sizeof(Sc6VariantEntry) +
+               i * sizeof(Sc6SlotEntry), sizeof(s->e));
+        s->link = SC6_NONE;
+        s->src = sc6_find(order, n, s->e.src_tb_offset);
+        if (s->src == SC6_NONE) {
+            sc6_die("slot %u: src_tb_offset 0x%" PRIx64
+                    " names no valid record", i, s->e.src_tb_offset);
+        }
+        r = &supercache.entries[s->src].record;
+        n_slot = s->e.slot_n;
+        if (n_slot > 1) {
+            sc6_die("slot %u: slot_n %u", i, n_slot);
+        }
+        if (s->e.kind != SC6_SLOT_GENERAL && s->e.kind != SC6_SLOT_SPEC) {
+            sc6_die("slot %u: bad kind %u", i, s->e.kind);
+        }
+        if (s->e.exit_class != SC6_EXIT_RETURN &&
+            s->e.exit_class != SC6_EXIT_STATIC) {
+            sc6_die("slot %u: bad exit_class %u", i, s->e.exit_class);
+        }
+        if (s->e.reserved) {
+            sc6_die("slot %u: reserved not zero", i);
+        }
+        jmp = r->jmp_insn_offset[n_slot];
+        rst = r->jmp_reset_offset[n_slot];
+        if (jmp == TB_JMP_OFFSET_INVALID || rst == TB_JMP_OFFSET_INVALID) {
+            sc6_die("slot %u: R has no registered jump %u", i, n_slot);
+        }
+        if (s->e.guard_len == 0 || s->e.guard_off >= r->tc_size ||
+            (uint64_t)s->e.guard_off + s->e.guard_len > r->tc_size) {
+            sc6_die("slot %u: guard [0x%" PRIx32 ", +0x%" PRIx32
+                    ") outside R's code", i, s->e.guard_off, s->e.guard_len);
+        }
+        g_end = s->e.guard_off + s->e.guard_len;
+        if (jmp < s->e.guard_off || jmp + 4 > g_end ||
+            rst < s->e.guard_off || rst >= g_end) {
+            sc6_die("slot %u: jump %u (insn 0x%x, reset 0x%x) outside the "
+                    "guard", i, n_slot, jmp, rst);
+        }
+        if ((r->tc_offset + jmp) % 4) {
+            sc6_die("slot %u: jump field not 4-aligned", i);
+        }
+        for (uint32_t k = 0; k < i; k++) {
+            if (sc6.slots[k].src == s->src &&
+                sc6.slots[k].e.slot_n == n_slot) {
+                sc6_die("slot %u: duplicates slot %u", i, k);
+            }
+        }
+        sc6.role[s->src] |= SC6_ROLE_SRC;
+    }
+
+    for (uint32_t i = 0; i < x.n_links; i++) {
+        Sc6Link *l = &sc6.links[i];
+        Sc6LinkEntry le;
+        const SupercacheRecord *c;
+
+        memcpy(&le, arrays + x.n_variants * sizeof(Sc6VariantEntry) +
+               x.n_slots * sizeof(Sc6SlotEntry) + i * sizeof(Sc6LinkEntry),
+               sizeof(le));
+        if (le.reserved) {
+            sc6_die("link %u: reserved not zero", i);
+        }
+        if (le.slot_index >= x.n_slots) {
+            sc6_die("link %u: slot_index %" PRIu32 " out of range",
+                    i, le.slot_index);
+        }
+        if (le.variant_index >= x.n_variants) {
+            sc6_die("link %u: variant_index %" PRIu32 " out of range",
+                    i, le.variant_index);
+        }
+        if (sc6.slots[le.slot_index].e.kind != SC6_SLOT_SPEC) {
+            sc6_die("link %u: slot %" PRIu32 " is not SPEC",
+                    i, le.slot_index);
+        }
+        if (sc6.slots[le.slot_index].link != SC6_NONE) {
+            sc6_die("slot %" PRIu32 ": more than one link", le.slot_index);
+        }
+        if (sc6.variants[le.variant_index].link != SC6_NONE) {
+            sc6_die("variant %" PRIu32 ": more than one link",
+                    le.variant_index);
+        }
+        c = &supercache.entries[sc6.variants[le.variant_index].general].record;
+        if ((sc6.slots[le.slot_index].e.target_vaddr & ~TARGET_PAGE_MASK) !=
+            (c->page_addr0 & ~TARGET_PAGE_MASK)) {
+            sc6_die("link %u: target 0x%" PRIx32
+                    " is not at C's page offset", i,
+                    sc6.slots[le.slot_index].e.target_vaddr);
+        }
+        sc6.slots[le.slot_index].link = i;
+        sc6.variants[le.variant_index].link = i;
+        l->slot = le.slot_index;
+        l->variant = le.variant_index;
+    }
+    for (uint32_t i = 0; i < x.n_slots; i++) {
+        if (sc6.slots[i].e.kind == SC6_SLOT_SPEC &&
+            sc6.slots[i].link == SC6_NONE) {
+            sc6_die("slot %u: SPEC slot has no link", i);
+        }
+    }
+    for (uint32_t i = 0; i < x.n_variants; i++) {
+        if (sc6.variants[i].link == SC6_NONE) {
+            sc6_die("variant %u: has no link", i);
+        }
+    }
+
+    /* Q4: variant code is loaded and never overwritten by translations. */
+    supercache.max_end = MAX(supercache.max_end, max_end);
+    sc6.loaded = true;
+    sc6.st.ext_load_ns = (g_get_monotonic_time() - t0) * 1000;
+}
+
+/* Q4: code and guard hashes, after the code pread in after_prologue. */
+static void sc6_verify_hashes(void)
+{
+    const uint8_t *buf = supercache.buffer;
+
+    for (uint32_t i = 0; i < sc6.n_variants; i++) {
+        const Sc6VariantEntry *e = &sc6.variants[i].e;
+
+        if (hash_bytes(SUPERCACHE_FNV_OFFSET, buf + e->tc_offset,
+                       e->end_offset - e->tc_offset) != e->code_fnv64) {
+            sc6_die("variant %u: code hash mismatch", i);
+        }
+    }
+    for (uint32_t i = 0; i < sc6.n_slots; i++) {
+        const Sc6Slot *s = &sc6.slots[i];
+        const SupercacheRecord *r = &supercache.entries[s->src].record;
+
+        if (hash_bytes(SUPERCACHE_FNV_OFFSET,
+                       buf + r->tc_offset + s->e.guard_off,
+                       s->e.guard_len) != s->e.guard_fnv64) {
+            sc6_die("slot %u: guard hash mismatch", i);
+        }
+    }
+}
+
+static bool sc6_is_variant(const TranslationBlock *tb, uint32_t *index)
+{
+    uintptr_t off = (uintptr_t)tb - (uintptr_t)supercache.buffer;
+
+    for (uint32_t i = 0; i < sc6.n_variants; i++) {
+        if (sc6.variants[i].e.tb_offset == off) {
+            if (index) {
+                *index = i;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* §4.6 arm-time conditions; returns SC6_REFUSE__COUNT when all hold. */
+static int sc6_arm_conditions(CPUState *cpu, TranslationBlock *R,
+                              TranslationBlock *G, uint32_t vc)
+{
+    CPUTLBEntryFull *full = NULL;
+    void *host = NULL;
+    int mmu_idx;
+
+    if (qatomic_read(&sc6.forbidden)) {
+        return SC6_REFUSE_FORBIDDEN;
+    }
+    if (scp_active) {
+        return SC6_REFUSE_PROFILE;
+    }
+    if (qatomic_read(&one_insn_per_tb)) {
+        return SC6_REFUSE_ONE_INSN;
+    }
+    if (qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
+        return SC6_REFUSE_NOCHAIN;
+    }
+    if (cpu->singlestep_enabled) {
+        return SC6_REFUSE_SINGLESTEP;
+    }
+    if (!QTAILQ_EMPTY(&cpu->breakpoints)) {
+        return SC6_REFUSE_BREAKPOINTS;
+    }
+    if (!QTAILQ_EMPTY(&cpu->watchpoints)) {
+        return SC6_REFUSE_WATCHPOINTS;
+    }
+    if ((tb_cflags(R) | tb_cflags(G)) & CF_INVALID) {
+        return SC6_REFUSE_INVALID;
+    }
+    if (tb_page_addr1(G) != -1) {
+        return SC6_REFUSE_TWO_PAGE;
+    }
+    /*
+     * The lookup's fetch MMU index: FIELD_EX32(G->flags, TBFLAG_ANY,
+     * MMUIDX) (target/arm/cpu.h, bits 4..7).  This file is compiled once
+     * for all targets, so the field is extracted by position; the load
+     * refuses any target other than arm.
+     */
+    mmu_idx = extract32(G->flags, 4, 4);
+    if (mmu_idx >= NB_MMU_MODES) {
+        return SC6_REFUSE_MMU_IDX;
+    }
+    probe_access_full_mmu(cpu_env(cpu), vc, 1, MMU_INST_FETCH, mmu_idx,
+                          &host, &full);
+    if (!host) {
+        return SC6_REFUSE_PROBE_NO_HOST;
+    }
+    if (!full || full->lg_page_size < TARGET_PAGE_BITS) {
+        return SC6_REFUSE_PROBE_PAGE_SIZE;
+    }
+    if (qemu_ram_addr_from_host(host) != tb_page_addr0(G)) {
+        return SC6_REFUSE_PROBE_MISMATCH;
+    }
+    return SC6_REFUSE__COUNT;
+}
+
+/* Build C' from G (= the live general C), as lookup_entry builds C. */
+static TranslationBlock *sc6_build_variant(CPUState *cpu, Sc6Variant *v,
+                                           TranslationBlock *G)
+{
+    TranslationBlock *cp = (TranslationBlock *)
+        ((uint8_t *)supercache.buffer + v->e.tb_offset);
+
+    memset(cp, 0, sizeof(*cp));
+    cp->pc = G->pc;
+    cp->cs_base = G->cs_base;
+    cp->flags = G->flags;
+    cp->cflags = tb_cflags(G);
+    cp->size = G->size;
+    cp->icount = G->icount;
+    cp->tc.ptr = (uint8_t *)supercache.buffer + v->e.tc_offset;
+    cp->tc.size = v->e.tc_size;
+    tb_set_page_addr0(cp, tb_page_addr0(G));
+    tb_set_page_addr1(cp, tb_page_addr1(G));
+    memcpy(cp->jmp_reset_offset, G->jmp_reset_offset,
+           sizeof(cp->jmp_reset_offset));
+    memcpy(cp->jmp_insn_offset, G->jmp_insn_offset,
+           sizeof(cp->jmp_insn_offset));
+    qemu_spin_init(&cp->jmp_lock);
+    cp->jmp_list_head = 0;
+    cp->jmp_list_next[0] = cp->jmp_list_next[1] = 0;
+    cp->jmp_dest[0] = cp->jmp_dest[1] = 0;
+    qemu_thread_jit_write();
+    for (int k = 0; k < 2; k++) {
+        if (cp->jmp_reset_offset[k] != TB_JMP_OFFSET_INVALID) {
+            tb_reset_jump(cp, k);
+        }
+    }
+    flush_idcache_range((uintptr_t)cp->tc.ptr, (uintptr_t)cp->tc.ptr,
+                        cp->tc.size);
+    tcg_tb_insert(cp);          /* region tree only: unwind finds C' */
+    v->built = cp;
+    sc6.st.variants_built++;
+    return cp;
+}
+
+static void sc6_try_arm(CPUState *cpu, uint32_t li)
+{
+    Sc6Link *l = &sc6.links[li];
+    Sc6Slot *s = &sc6.slots[l->slot];
+    Sc6Variant *v = &sc6.variants[l->variant];
+    TranslationBlock *R = sc6.live[s->src];
+    TranslationBlock *G = sc6.live[v->general];
+    TranslationBlock *cp;
+    int n = s->e.slot_n;
+    int why;
+
+    if (l->armed || l->disarmed_epoch || !R || !G) {
+        return;
+    }
+    why = sc6_arm_conditions(cpu, R, G, s->e.target_vaddr);
+    if (why != SC6_REFUSE__COUNT) {
+        sc6.st.refused[why]++;
+        return;
+    }
+    cp = v->built ? v->built : sc6_build_variant(cpu, v, G);
+
+    qemu_thread_jit_write();
+    qemu_spin_lock(&G->jmp_lock);
+    if (!(G->cflags & CF_INVALID) &&
+        qatomic_cmpxchg(&R->jmp_dest[n], (uintptr_t)NULL,
+                        (uintptr_t)G) == (uintptr_t)NULL) {
+        tb_set_jmp_target(R, n, (uintptr_t)cp->tc.ptr);
+        R->jmp_list_next[n] = G->jmp_list_head;
+        G->jmp_list_head = (uintptr_t)R | n;
+        l->armed = true;
+        sc6.st.armed++;
+    } else {
+        sc6.st.refused[SC6_REFUSE_BUSY]++;
+    }
+    qemu_spin_unlock(&G->jmp_lock);
+    qemu_thread_jit_execute();
+}
+
+/* Q5: called at the end of lookup_entry() when @tb was linked. */
+static void sc6_on_activate(CPUState *cpu, uint32_t index,
+                            TranslationBlock *tb)
+{
+    sc6.live[index] = tb;
+    sc6.st.activations++;
+    for (uint32_t i = 0; i < sc6.n_links; i++) {
+        const Sc6Link *l = &sc6.links[i];
+
+        if (sc6.slots[l->slot].src == index ||
+            sc6.variants[l->variant].general == index) {
+            sc6_try_arm(cpu, i);
+        }
+    }
+}
+
+/*
+ * Debug invariant (design §5.6): after a disarm, no SPEC slot points at a
+ * variant, no guarded slot and no variant slot is linked.
+ */
+static void sc6_check_disarmed(void)
+{
+    uint64_t bad = 0;
+
+    sc6.st.invariant_checks++;
+    for (uint32_t i = 0; i < sc6.n_slots; i++) {
+        const Sc6Slot *s = &sc6.slots[i];
+        TranslationBlock *R = sc6.live[s->src];
+        int n = s->e.slot_n;
+
+        if (!R || (tb_cflags(R) & CF_INVALID)) {
+            continue;
+        }
+        if ((qatomic_read(&R->jmp_dest[n]) & ~(uintptr_t)1) ||
+            R->jmp_target_addr[n] !=
+            (uintptr_t)R->tc.ptr + R->jmp_reset_offset[n]) {
+            bad++;
+        }
+    }
+    for (uint32_t i = 0; i < sc6.n_variants; i++) {
+        TranslationBlock *cp = sc6.variants[i].built;
+
+        if (!cp || (tb_cflags(cp) & CF_INVALID)) {
+            continue;
+        }
+        for (int n = 0; n < 2; n++) {
+            if (cp->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID &&
+                (qatomic_read(&cp->jmp_dest[n]) & ~(uintptr_t)1)) {
+                bad++;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < sc6.n_links; i++) {
+        if (sc6.links[i].armed) {
+            bad++;
+        }
+    }
+    sc6.st.invariant_violations += bad;
+#ifdef CONFIG_DEBUG_TCG
+    g_assert(bad == 0);
+#endif
+}
+
+/*
+ * Unlink every guarded slot of a live, valid R and both registered slots of
+ * every built variant; clear every armed link for the rest of the epoch.
+ * Runs on the vCPU thread (TLB-flush workers) or in the exclusive context
+ * (Q9/Q11 disarm).  Returns the number of armed links cleared.
+ */
+static uint32_t sc6_unlink_all(void)
+{
+    uint32_t cleared = 0;
+
+    qemu_thread_jit_write();
+    for (uint32_t i = 0; i < sc6.n_slots; i++) {
+        TranslationBlock *R = sc6.live[sc6.slots[i].src];
+
+        if (R && !(tb_cflags(R) & CF_INVALID)) {
+            tb_unlink_jump(R, sc6.slots[i].e.slot_n);
+            sc6.st.slots_unlinked++;
+        }
+    }
+    for (uint32_t i = 0; i < sc6.n_variants; i++) {
+        TranslationBlock *cp = sc6.variants[i].built;
+
+        if (!cp || (tb_cflags(cp) & CF_INVALID)) {
+            continue;
+        }
+        for (int n = 0; n < 2; n++) {
+            if (cp->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+                tb_unlink_jump(cp, n);
+                sc6.st.variant_slots_unlinked++;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < sc6.n_links; i++) {
+        Sc6Link *l = &sc6.links[i];
+
+        if (l->armed) {
+            cleared++;
+            l->armed = false;
+            l->disarmed_epoch = true;
+        }
+    }
+    qemu_thread_jit_execute();
+    if (tcg_sc6_stats_active) {
+        sc6_check_disarmed();
+    }
+    return cleared;
+}
+
+static bool sc6_any_live(void)
+{
+    for (uint32_t i = 0; i < sc6.n_slots; i++) {
+        if (sc6.live[sc6.slots[i].src]) {
+            return true;
+        }
+    }
+    for (uint32_t i = 0; i < sc6.n_variants; i++) {
+        if (sc6.variants[i].built) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sc6_forbid(int reason)
+{
+    if (!qatomic_xchg(&sc6.forbidden, true)) {
+        qatomic_set(&sc6.forbid_reason, reason);
+    }
+}
+
+/* Q7: end of every vCPU TLB-flush worker (cputlb.c). */
+void tcg_supercache_mapping_changed(CPUState *cpu)
+{
+    uint32_t cleared;
+
+    if (likely(!sc6.loaded)) {
+        return;
+    }
+    sc6.st.tlb_hook_calls++;
+    if (!sc6_any_live()) {
+        return;
+    }
+    cleared = sc6_unlink_all();
+    sc6.st.disarm_tlb_events++;
+    sc6.st.disarm_tlb_links += cleared;
+    if (cleared && ++sc6.disarms >= SC6_MAX_DISARMS) {
+        sc6_forbid(SC6_FORBID_TLB_BUDGET);
+    }
+}
+
+static void sc6_disarm_all_work(CPUState *cpu, run_on_cpu_data data)
+{
+    g_assert(cpu_in_exclusive_context(cpu));
+    if (sc6.loaded && sc6_any_live()) {
+        sc6.st.disarm_forbid_events++;
+        sc6.st.disarm_forbid_links += sc6_unlink_all();
+    }
+}
+
+/*
+ * Q9: tcg_set_one_insn_per_tb(true).  At run time this runs on the monitor
+ * thread (HMP one-insn-per-tb), so it only sets the flag and queues the
+ * disarm into the exclusive context, like tb_flush.
+ */
+void tcg_supercache_v6_one_insn_per_tb(void)
+{
+    sc6.st.forbid_requests++;
+    sc6_forbid(SC6_FORBID_ONE_INSN);
+    if (supercache.initialized && sc6.loaded && first_cpu) {
+        async_safe_run_on_cpu(first_cpu, sc6_disarm_all_work,
+                              RUN_ON_CPU_NULL);
+    }
+}
+
+/* Q11: plugin reset/uninstall and scoreboard growth (exclusive context). */
+void tcg_supercache_v6_forbid(void)
+{
+    sc6.st.forbid_requests++;
+    sc6_forbid(SC6_FORBID_PLUGIN);
+    if (sc6.loaded && sc6_any_live()) {
+        sc6.st.disarm_forbid_events++;
+        sc6.st.disarm_forbid_links += sc6_unlink_all();
+    }
+}
+
+/* Q6: tcg_supercache_runtime_reset (tb_flush, exclusive context). */
+static void sc6_runtime_reset(void)
+{
+    if (!sc6.loaded) {
+        return;
+    }
+    sc6.st.flush_resets++;
+    for (uint32_t i = 0; i < sc6.n_links; i++) {
+        if (sc6.links[i].armed) {
+            sc6.st.disarm_flush_links++;
+        }
+        sc6.links[i].armed = false;
+        sc6.links[i].disarmed_epoch = false;
+    }
+    for (uint32_t i = 0; i < sc6.n_variants; i++) {
+        sc6.variants[i].built = NULL;
+    }
+    memset(sc6.live, 0, sc6.n_entries * sizeof(*sc6.live));
+}
+
+/* Q10 (cpu_tb_exec), only while QEMU_SC_V6_STATS is set. */
+void tcg_supercache_v6_note_exit(TranslationBlock *tb, int tb_exit)
+{
+    if (sc6.loaded && sc6_is_variant(tb, NULL)) {
+        sc6.st.variant_exits++;
+        if (tb_exit == TB_EXIT_REQUESTED) {
+            sc6.st.variant_entry_exits++;
+        }
+    }
+}
+
+/* Q10 (cpu_restore_state_from_tb), only while QEMU_SC_V6_STATS is set. */
+void tcg_supercache_v6_note_restore(TranslationBlock *tb)
+{
+    if (sc6.loaded && sc6_is_variant(tb, NULL)) {
+        sc6.st.variant_restores++;
+    }
+}
+
+static void sc6_write_stats(void)
+{
+    g_autoptr(GString) j = g_string_new("{\n");
+    int reason = qatomic_read(&sc6.forbid_reason);
+
+    g_string_append_printf(j, "  \"schema\": \"qemu-sc-v6-stats@1\",\n");
+    g_string_append_printf(j, "  \"loaded\": %s,\n",
+                           sc6.loaded ? "true" : "false");
+    g_string_append_printf(j, "  \"file_version\": %" PRIu32 ",\n",
+                           supercache.loaded_header.version);
+    g_string_append_printf(j, "  \"feature_flags\": %" PRIu32 ",\n",
+                           sc6.features);
+    g_string_append(j, "  \"artifact_id8\": \"");
+    for (int i = 0; i < 8; i++) {
+        g_string_append_printf(j, "%02x", sc6.artifact_id8[i]);
+    }
+    g_string_append(j, "\",\n");
+    g_string_append_printf(j, "  \"n_variants\": %" PRIu32 ",\n"
+                           "  \"n_slots\": %" PRIu32 ",\n"
+                           "  \"n_links\": %" PRIu32 ",\n",
+                           sc6.n_variants, sc6.n_slots, sc6.n_links);
+    g_string_append_printf(j, "  \"ext_load_ns\": %" PRId64 ",\n",
+                           sc6.st.ext_load_ns);
+    g_string_append_printf(j, "  \"activations\": %" PRIu64 ",\n",
+                           sc6.st.activations);
+    g_string_append_printf(j, "  \"links_armed\": %" PRIu64 ",\n",
+                           sc6.st.armed);
+    g_string_append(j, "  \"refused\": {");
+    for (int i = 0; i < SC6_REFUSE__COUNT; i++) {
+        g_string_append_printf(j, "%s\"%s\": %" PRIu64, i ? ", " : "",
+                               sc6_refuse_names[i], sc6.st.refused[i]);
+    }
+    g_string_append(j, "},\n");
+    g_string_append_printf(j,
+        "  \"variants_built\": %" PRIu64 ",\n"
+        "  \"tlb_hook_calls\": %" PRIu64 ",\n"
+        "  \"disarm_tlb_events\": %" PRIu64 ",\n"
+        "  \"disarm_tlb_links\": %" PRIu64 ",\n"
+        "  \"flush_resets\": %" PRIu64 ",\n"
+        "  \"disarm_flush_links\": %" PRIu64 ",\n"
+        "  \"forbid_requests\": %" PRIu64 ",\n"
+        "  \"disarm_forbid_events\": %" PRIu64 ",\n"
+        "  \"disarm_forbid_links\": %" PRIu64 ",\n"
+        "  \"slots_unlinked\": %" PRIu64 ",\n"
+        "  \"variant_slots_unlinked\": %" PRIu64 ",\n"
+        "  \"variant_exits\": %" PRIu64 ",\n"
+        "  \"variant_entry_exits\": %" PRIu64 ",\n"
+        "  \"variant_restores\": %" PRIu64 ",\n"
+        "  \"invariant_checks\": %" PRIu64 ",\n"
+        "  \"invariant_violations\": %" PRIu64 ",\n",
+        sc6.st.variants_built, sc6.st.tlb_hook_calls,
+        sc6.st.disarm_tlb_events, sc6.st.disarm_tlb_links,
+        sc6.st.flush_resets, sc6.st.disarm_flush_links,
+        sc6.st.forbid_requests, sc6.st.disarm_forbid_events,
+        sc6.st.disarm_forbid_links, sc6.st.slots_unlinked,
+        sc6.st.variant_slots_unlinked, sc6.st.variant_exits,
+        sc6.st.variant_entry_exits, sc6.st.variant_restores,
+        sc6.st.invariant_checks, sc6.st.invariant_violations);
+    g_string_append(j, "  \"links\": [");
+    for (uint32_t i = 0; i < sc6.n_links; i++) {
+        g_string_append_printf(j, "%s{\"armed\": %s, \"disarmed_epoch\": %s}",
+                               i ? ", " : "",
+                               sc6.links[i].armed ? "true" : "false",
+                               sc6.links[i].disarmed_epoch ? "true" : "false");
+    }
+    g_string_append(j, "],\n");
+    g_string_append_printf(j, "  \"tlb_disarm_budget_used\": %" PRIu32 ",\n",
+                           sc6.disarms);
+    g_string_append_printf(j, "  \"forbidden\": %s,\n",
+                           qatomic_read(&sc6.forbidden) ? "true" : "false");
+    g_string_append_printf(j, "  \"forbid_reason\": \"%s\"\n}\n",
+                           sc6_forbid_names[reason]);
+    if (!g_file_set_contents(sc6.stats_path, j->str, j->len, NULL)) {
+        warn_report("supercache: cannot write QEMU_SC_V6_STATS file '%s'",
+                    sc6.stats_path);
+    }
+}
+
+static void sc6_configure_from_env(void)
+{
+    const char *path = getenv("QEMU_SC_V6_STATS");
+
+    if (!path || !*path) {
+        return;
+    }
+    if (!g_path_is_absolute(path)) {
+        error_report("supercache: QEMU_SC_V6_STATS must be an absolute path");
+        exit(EXIT_FAILURE);
+    }
+    sc6.stats_path = g_strdup(path);
+    tcg_sc6_stats_active = true;
+    atexit(sc6_write_stats);
+}
+
 int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
                                      Error **errp)
 {
@@ -610,10 +1688,16 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
 
     signature = runtime_signature();
     if (pread(supercache.fd, &disk_header, sizeof(disk_header), 0) ==
-            sizeof(disk_header) &&
-        valid_header(&disk_header, size, signature)) {
-        reuse = true;
-        supercache.header = disk_header;
+            sizeof(disk_header)) {
+        if (valid_header(&disk_header, size, signature)) {
+            reuse = true;
+            supercache.header = disk_header;
+        } else if (memcmp(disk_header.magic, SUPERCACHE_MAGIC, 8) == 0 &&
+                   disk_header.version == SC6_VERSION) {
+            /* Q1: the stock path below truncates; say so for v6 files. */
+            warn_report("supercache: discarding v6 file: %s",
+                        header_problem(&disk_header, size, signature));
+        }
     }
 
     supercache.size = size;
@@ -645,6 +1729,9 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
     if (reuse) {
         load_records();
         flat_index_init();
+        if (supercache.header.version == SC6_VERSION) {
+            sc6_load_ext();                         /* Q2, Q3, Q4 */
+        }
         supercache.loaded_max_end = supercache.max_end;
         supercache.loaded_header = disk_header;
     } else {
@@ -689,6 +1776,9 @@ void tcg_supercache_after_prologue(TCGContext *s)
                          errno ? strerror(errno) : "short read");
             exit(EXIT_FAILURE);
         }
+        if (sc6.loaded) {
+            sc6_verify_hashes();                    /* Q4 */
+        }
         qatomic_set(&s->code_gen_ptr,
                     (uint8_t *)supercache.buffer + supercache.max_end);
     }
@@ -719,6 +1809,7 @@ void tcg_supercache_runtime_reset(void)
             supercache.entries[i].used = false;
             supercache.entries[i].invalid = false;
         }
+        sc6_runtime_reset();                        /* Q6 */
     }
 }
 
@@ -872,6 +1963,13 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     if (linked != tb) {
         tcg_tb_remove(tb);
         return linked;
+    }
+    if (unlikely(sc6.loaded)) {
+        uint32_t index = entry - supercache.entries;
+
+        if (index < sc6.n_entries && sc6.role[index]) {
+            sc6_on_activate(cpu, index, tb);        /* Q5 */
+        }
     }
     return tb;
 }
@@ -1101,6 +2199,28 @@ bool tcg_supercache_get_info(TCGSupercacheInfo *info)
 {
     memset(info, 0, sizeof(*info));
     return false;
+}
+
+bool tcg_sc6_stats_active;
+
+void tcg_supercache_mapping_changed(CPUState *cpu)
+{
+}
+
+void tcg_supercache_v6_one_insn_per_tb(void)
+{
+}
+
+void tcg_supercache_v6_forbid(void)
+{
+}
+
+void tcg_supercache_v6_note_exit(TranslationBlock *tb, int tb_exit)
+{
+}
+
+void tcg_supercache_v6_note_restore(TranslationBlock *tb)
+{
 }
 
 #endif /* CONFIG_LINUX && HOST_X86_64 */
