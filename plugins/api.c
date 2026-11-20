@@ -50,6 +50,7 @@
 #include "elf.h"
 #include "hw/core/cpu.h"
 #include "exec/icount.h"
+#include "tcg/supercache.h"
 #include "system/cpu-timers-internal.h"
 
 /* Uninstall and Reset handlers */
@@ -478,6 +479,19 @@ void qemu_plugin_register_vcpu_tb_trans_cb(qemu_plugin_id_t id,
 {
     plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_TB_TRANS, cb);
 }
+
+void qemu_plugin_register_vcpu_tb_trans_cb_with_restore_check(
+    qemu_plugin_id_t id, qemu_plugin_vcpu_tb_trans_cb_t cb,
+    qemu_plugin_tb_restore_check_t restore_check)
+{
+    plugin_register_tb_restore_cb(id, cb, restore_check);
+}
+
+void qemu_plugin_supercache_restore_window(bool started)
+{
+    tcg_supercache_restore_window(started);
+}
+
 
 void qemu_plugin_register_vcpu_syscall_cb(qemu_plugin_id_t id,
                                           qemu_plugin_vcpu_syscall_cb_t cb)

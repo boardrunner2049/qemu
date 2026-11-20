@@ -403,6 +403,26 @@ QEMU_PLUGIN_API
 void qemu_plugin_register_vcpu_tb_trans_cb(qemu_plugin_id_t id,
                                            qemu_plugin_vcpu_tb_trans_cb_t cb);
 
+#define QEMU_PLUGIN_SC_RESTORE_API 1
+
+/* A side-effect-free live predicate for omitted restore-time replay.
+ * A true result promises that replaying this callback for the actual byte
+ * interval would leave no state or externally visible effect. Registration
+ * applies to cache reactivation only. Regular TCG translation is unchanged.
+ * Predicates must not call back into QEMU or alter plugin registrations.
+ */
+typedef bool (*qemu_plugin_tb_restore_check_t)(uint64_t pc, uint32_t guest_size);
+
+QEMU_PLUGIN_API
+void qemu_plugin_register_vcpu_tb_trans_cb_with_restore_check(
+    qemu_plugin_id_t id, qemu_plugin_vcpu_tb_trans_cb_t cb,
+    qemu_plugin_tb_restore_check_t restore_check);
+
+/* Optional diagnostic sampling window used by a plugin's benchmark markers. */
+QEMU_PLUGIN_API
+void qemu_plugin_supercache_restore_window(bool started);
+
+
 QEMU_PLUGIN_API
 void qemu_plugin_load_elf(char * elf);
 

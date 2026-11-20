@@ -1891,6 +1891,214 @@ void tcg_supercache_record(TranslationBlock *tb, const void *end)
     index_record(&record, true);
 }
 
+typedef struct RestoreHint {
+    uint64_t offset;
+    uint32_t checksum;
+} RestoreHint;
+
+typedef struct RestoreCounts {
+    uint64_t attempted;
+    uint64_t nominated;
+    uint64_t skipped;
+    uint64_t vetoed;
+    uint64_t callbacks_executed;
+} RestoreCounts;
+
+static GArray *restore_hints;
+static bool restore_initialized;
+static bool restore_stats_window;
+static const char *restore_stats_path;
+static RestoreCounts restore_all, restore_benchmark;
+
+static void write_restore_counts(FILE *f, const RestoreCounts *c)
+{
+    fprintf(f, "{\"attempted\":%" PRIu64 ",\"nominated\":%" PRIu64
+            ",\"skipped\":%" PRIu64 ",\"vetoed\":%" PRIu64
+            ",\"callbacks_executed\":%" PRIu64 "}",
+            c->attempted, c->nominated, c->skipped, c->vetoed,
+            c->callbacks_executed);
+}
+
+static void write_restore_stats(void)
+{
+    FILE *f = fopen(restore_stats_path, "w");
+
+    if (!f) {
+        return;
+    }
+    fprintf(f, "{\"schema\":\"fastdyn.supercache_restore_stats/1\","
+            "\"records_validated\":%u,\"hint_records\":%u,"
+            "\"hint_file_valid\":%s,\"all\":",
+            supercache.entry_count, restore_hints ? restore_hints->len : 0,
+            restore_hints ? "true" : "false");
+    write_restore_counts(f, &restore_all);
+    fputs(",\"benchmark\":", f);
+    write_restore_counts(f, &restore_benchmark);
+    fputs("}\n", f);
+    fclose(f);
+}
+
+void tcg_supercache_restore_window(bool started)
+{
+    restore_stats_window = started;
+}
+
+static bool restore_uint(const char *token, int base, uint64_t *value)
+{
+    char *end;
+    const char *digits = token;
+
+    if (base == 16 && g_str_has_prefix(digits, "0x")) {
+        digits += 2;
+    }
+    if (!*digits) {
+        return false;
+    }
+    for (const char *p = digits; *p; p++) {
+        if (!(base == 16 ? g_ascii_isxdigit(*p) : g_ascii_isdigit(*p))) {
+            return false;
+        }
+    }
+    errno = 0;
+    *value = g_ascii_strtoull(digits, &end, base);
+    return !errno && !*end;
+}
+
+static bool restore_header_matches(char *line, const SupercacheHeader *h)
+{
+    g_auto(GStrv) parts = g_strsplit(g_strchomp(line), " ", -1);
+    uint64_t signature, header_sum, records;
+
+    return g_strv_length(parts) == 5 &&
+           !strcmp(parts[0], "FD_SC_RESTORE_HINTS") && !strcmp(parts[1], "1") &&
+           restore_uint(parts[2], 16, &signature) &&
+           restore_uint(parts[3], 16, &header_sum) &&
+           restore_uint(parts[4], 10, &records) &&
+           signature == h->runtime_signature && header_sum == h->checksum &&
+           records == h->record_count;
+}
+
+static bool restore_hint_parse(char *line, RestoreHint *row)
+{
+    g_auto(GStrv) parts = g_strsplit(g_strchomp(line), " ", -1);
+    uint64_t checksum;
+
+    if (g_strv_length(parts) != 2 ||
+        !restore_uint(parts[0], 16, &row->offset) ||
+        !restore_uint(parts[1], 16, &checksum) || checksum > UINT32_MAX) {
+        return false;
+    }
+    row->checksum = checksum;
+    return true;
+}
+
+static void init_restore_hints(void)
+{
+    const char *mode = getenv("QEMU_SC_RESTORE_REPLAY");
+    const char *explicit = getenv("QEMU_SC_RESTORE_HINTS");
+    g_autofree char *sibling = NULL;
+    const SupercacheHeader *h = &supercache.loaded_header;
+    char line[160];
+    struct stat st;
+    FILE *f;
+    int fd;
+    GArray *rows;
+
+    restore_initialized = true;
+    restore_stats_path = getenv("QEMU_SC_RESTORE_STATS");
+    if (restore_stats_path && *restore_stats_path) {
+        atexit(write_restore_stats);
+    } else {
+        restore_stats_path = NULL;
+    }
+    if ((mode && strcmp(mode, "verified")) || supercache.flat ||
+        h->version != SUPERCACHE_VERSION || h->record_count > UINT32_MAX ||
+        !h->record_count) {
+        return;
+    }
+
+    if (!explicit) {
+        sibling = g_strconcat(supercache.path, ".restore-hints", NULL);
+    }
+    fd = open(explicit ?: sibling, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        return;
+    }
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > sizeof(line) * (h->record_count + 1)) {
+        close(fd);
+        return;
+    }
+    f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return;
+    }
+    if (!fgets(line, sizeof(line), f) || !strchr(line, '\n') ||
+        !restore_header_matches(line, h)) {
+        fclose(f);
+        return;
+    }
+
+    rows = g_array_new(false, false, sizeof(RestoreHint));
+    while (fgets(line, sizeof(line), f)) {
+        RestoreHint row;
+        if (!strchr(line, '\n') || rows->len >= h->record_count ||
+            !restore_hint_parse(line, &row) ||
+            (rows->len &&
+             row.offset <= g_array_index(rows, RestoreHint, rows->len - 1).offset)) {
+            goto refuse;
+        }
+        g_array_append_val(rows, row);
+    }
+    if (ferror(f) || !rows->len) {
+        goto refuse;
+    }
+    fclose(f);
+    restore_hints = rows;
+    return;
+
+refuse:
+    fclose(f);
+    g_array_unref(rows);
+}
+
+static bool restore_hint_matches(const SupercacheRecord *r)
+{
+    if (unlikely(!restore_initialized)) {
+        init_restore_hints();
+    }
+    if (!restore_hints || scc_active || scp_active) {
+        return false;
+    }
+    unsigned low = 0, high = restore_hints->len;
+
+    while (low < high) {
+        unsigned mid = low + (high - low) / 2;
+        const RestoreHint *hint = &g_array_index(restore_hints, RestoreHint, mid);
+
+        if (hint->offset == r->tb_offset) {
+            return hint->checksum == r->checksum;
+        }
+        if (hint->offset > r->tb_offset) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return false;
+}
+
+static void note_restore(RestoreCounts *c, bool nominated, bool skip,
+                         unsigned callbacks)
+{
+    c->attempted++;
+    c->nominated += nominated;
+    c->skipped += skip;
+    c->vetoed += nominated && !skip;
+    c->callbacks_executed += callbacks;
+}
+
 static bool second_page_matches(CPUState *cpu, TCGTBCPUState state,
                                 const SupercacheRecord *record)
 {
@@ -1950,7 +2158,19 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     if (tb->jmp_reset_offset[1] != TB_JMP_OFFSET_INVALID) {
         tb_reset_jump(tb, 1);
     }
-    qemu_plugin_supercache_rehydrate(cpu, tb, state.pc);
+    bool nominated = restore_hint_matches(r);
+    bool skip = nominated && !cpu->singlestep_enabled &&
+                QTAILQ_EMPTY(&cpu->breakpoints) && QTAILQ_EMPTY(&cpu->watchpoints) &&
+                qemu_plugin_tb_restore_omittable(cpu, state.pc, r->guest_size);
+    unsigned callbacks = qemu_plugin_supercache_rehydrate(cpu, tb, state.pc,
+                                                           skip);
+
+    if (unlikely(restore_stats_path)) {
+        note_restore(&restore_all, nominated, skip, callbacks);
+        if (restore_stats_window) {
+            note_restore(&restore_benchmark, nominated, skip, callbacks);
+        }
+    }
     flush_idcache_range((uintptr_t)tb->tc.ptr,
                         (uintptr_t)tb->tc.ptr, tb->tc.size);
     entry->used = true;
@@ -2135,6 +2355,10 @@ bool tcg_supercache_get_info(TCGSupercacheInfo *info)
 }
 
 #else /* CONFIG_LINUX && HOST_X86_64 */
+
+void tcg_supercache_restore_window(bool started)
+{
+}
 
 void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads)

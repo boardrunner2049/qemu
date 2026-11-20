@@ -652,8 +652,8 @@ static int64_t supercache_decode_sleb128(const uint8_t **pp)
  * instrumentation.  No TCG operations are emitted here: the instrumentation
  * itself is already present in the cached host code.
  */
-void qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
-                                      vaddr pc)
+unsigned qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
+                                          vaddr pc, bool omit)
 {
     DisasContextBase db = { 0 };
     struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
@@ -663,7 +663,20 @@ void qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
 
     if (!test_bit(QEMU_PLUGIN_EV_VCPU_TB_TRANS,
                   cpu->plugin_state->event_mask)) {
-        return;
+        return 0;
+    }
+
+    if (omit) {
+        /* Preserve the original executable-page probes, which may fault. */
+        get_page_addr_code_hostp(cpu_env(cpu), pc, &host_pc);
+        if (tb_page_addr1(tb) != (tb_page_addr_t)-1) {
+            get_page_addr_code_hostp(cpu_env(cpu), TARGET_PAGE_ALIGN(pc),
+                                     &db.host_addr[1]);
+        }
+        tcg_ctx->gen_tb = NULL;
+        tcg_ctx->plugin_db = NULL;
+        tcg_ctx->plugin_insn = NULL;
+        return 0;
     }
 
     if (!ptb) {
@@ -732,8 +745,9 @@ void qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
 
     tcg_ctx->plugin_db = &db;
     tcg_ctx->gen_tb = tb;
-    qemu_plugin_tb_trans_cb(cpu, ptb);
+    unsigned callbacks = qemu_plugin_tb_trans_cb(cpu, ptb);
     tcg_ctx->gen_tb = NULL;
     tcg_ctx->plugin_db = NULL;
     tcg_ctx->plugin_insn = NULL;
+    return callbacks;
 }

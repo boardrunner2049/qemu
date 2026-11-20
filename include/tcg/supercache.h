@@ -17,6 +17,7 @@ uint64_t tcg_supercache_loaded_max_end(void);
 int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
                                      Error **errp);
 void tcg_supercache_after_prologue(TCGContext *s);
+void tcg_supercache_restore_window(bool started);
 void tcg_supercache_runtime_reset(void);
 void tcg_supercache_record(TranslationBlock *tb, const void *end);
 TranslationBlock *tcg_supercache_lookup(CPUState *cpu, TCGTBCPUState state,
@@ -62,6 +63,10 @@ static inline int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
                                                    Error **errp)
 {
     return 0;
+}
+
+static inline void tcg_supercache_restore_window(bool started)
+{
 }
 
 static inline void tcg_supercache_after_prologue(TCGContext *s)

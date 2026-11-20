@@ -34,6 +34,7 @@ void force_python_link(void) {
 struct qemu_plugin_cb {
     struct qemu_plugin_ctx *ctx;
     union qemu_plugin_cb_sig f;
+    qemu_plugin_tb_restore_check_t restore_check;
     void *udata;
     QLIST_ENTRY(qemu_plugin_cb) entry;
 };
@@ -161,7 +162,8 @@ static void plugin_cb__udata(enum qemu_plugin_event ev)
 
 static void
 do_plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
-                      void *func, void *udata)
+                      void *func, void *udata,
+                      qemu_plugin_tb_restore_check_t restore_check)
 {
     struct qemu_plugin_ctx *ctx;
 
@@ -177,11 +179,13 @@ do_plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
         if (cb) {
             cb->f.generic = func;
             cb->udata = udata;
+            cb->restore_check = restore_check;
         } else {
             cb = g_new(struct qemu_plugin_cb, 1);
             cb->ctx = ctx;
             cb->f.generic = func;
             cb->udata = udata;
+            cb->restore_check = restore_check;
             ctx->callbacks[ev] = cb;
             QLIST_INSERT_HEAD_RCU(&plugin.cb_lists[ev], cb, entry);
             if (!test_bit(ev, plugin.mask)) {
@@ -198,14 +202,22 @@ do_plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
 void plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
                         void *func)
 {
-    do_plugin_register_cb(id, ev, func, NULL);
+    do_plugin_register_cb(id, ev, func, NULL, NULL);
 }
 
 void
 plugin_register_cb_udata(qemu_plugin_id_t id, enum qemu_plugin_event ev,
                          void *func, void *udata)
 {
-    do_plugin_register_cb(id, ev, func, udata);
+    do_plugin_register_cb(id, ev, func, udata, NULL);
+}
+
+void plugin_register_tb_restore_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_vcpu_tb_trans_cb_t cb,
+                                   qemu_plugin_tb_restore_check_t restore_check)
+{
+    do_plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_TB_TRANS, cb, NULL,
+                          restore_check);
 }
 
 CPUPluginState *qemu_plugin_create_vcpu_state(void)
@@ -486,10 +498,33 @@ void plugin_register_vcpu_mem_cb(GArray **arr,
  * have type information
  */
 QEMU_DISABLE_CFI
-void qemu_plugin_tb_trans_cb(CPUState *cpu, struct qemu_plugin_tb *tb)
+bool qemu_plugin_tb_restore_omittable(CPUState *cpu, vaddr pc, uint32_t size)
+{
+    const enum qemu_plugin_event ev = QEMU_PLUGIN_EV_VCPU_TB_TRANS;
+    struct qemu_plugin_cb *cb;
+    bool any = false;
+
+    if (!test_bit(ev, cpu->plugin_state->event_mask)) {
+        return false;
+    }
+    /* Predicates observe the registered callbacks for this restore event. */
+    QEMU_LOCK_GUARD(&plugin.lock);
+    QLIST_FOREACH(cb, &plugin.cb_lists[ev], entry) {
+        if (!cb->restore_check || !cb->restore_check(pc, size)) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
+QEMU_DISABLE_CFI
+unsigned qemu_plugin_tb_trans_cb(CPUState *cpu, struct qemu_plugin_tb *tb)
 {
     struct qemu_plugin_cb *cb, *next;
     enum qemu_plugin_event ev = QEMU_PLUGIN_EV_VCPU_TB_TRANS;
+
+    unsigned callbacks = 0;
 
     /* no plugin_state->event_mask check here; caller should have checked */
 
@@ -497,7 +532,9 @@ void qemu_plugin_tb_trans_cb(CPUState *cpu, struct qemu_plugin_tb *tb)
         qemu_plugin_vcpu_tb_trans_cb_t func = cb->f.vcpu_tb_trans;
 
         func(cb->ctx->id, tb);
+        callbacks++;
     }
+    return callbacks;
 }
 
 /*

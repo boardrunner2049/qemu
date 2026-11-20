@@ -79,6 +79,9 @@ void plugin_reset_uninstall(qemu_plugin_id_t id,
                             qemu_plugin_simple_cb_t cb,
                             bool reset);
 
+void plugin_register_tb_restore_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_vcpu_tb_trans_cb_t cb,
+                                   qemu_plugin_tb_restore_check_t restore_check);
 void plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
                         void *func);
 

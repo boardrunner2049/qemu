@@ -162,9 +162,10 @@ CPUPluginState *qemu_plugin_create_vcpu_state(void);
 
 void qemu_plugin_vcpu_init_hook(CPUState *cpu);
 void qemu_plugin_vcpu_exit_hook(CPUState *cpu);
-void qemu_plugin_tb_trans_cb(CPUState *cpu, struct qemu_plugin_tb *tb);
-void qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
-                                      vaddr pc);
+unsigned qemu_plugin_tb_trans_cb(CPUState *cpu, struct qemu_plugin_tb *tb);
+bool qemu_plugin_tb_restore_omittable(CPUState *cpu, vaddr pc, uint32_t size);
+unsigned qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
+                                          vaddr pc, bool omit);
 void qemu_plugin_vcpu_idle_cb(CPUState *cpu);
 void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
 void
@@ -239,13 +240,18 @@ static inline void qemu_plugin_vcpu_init_hook(CPUState *cpu)
 static inline void qemu_plugin_vcpu_exit_hook(CPUState *cpu)
 { }
 
-static inline void qemu_plugin_tb_trans_cb(CPUState *cpu,
-                                           struct qemu_plugin_tb *tb)
-{ }
+static inline unsigned qemu_plugin_tb_trans_cb(CPUState *cpu,
+                                               struct qemu_plugin_tb *tb)
+{ return 0; }
 
-static inline void
-qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb, vaddr pc)
-{ }
+static inline bool
+qemu_plugin_tb_restore_omittable(CPUState *cpu, vaddr pc, uint32_t size)
+{ return false; }
+
+static inline unsigned
+qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb, vaddr pc,
+                                  bool omit)
+{ return 0; }
 
 static inline void qemu_plugin_vcpu_idle_cb(CPUState *cpu)
 { }
