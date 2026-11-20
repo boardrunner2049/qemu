@@ -2012,8 +2012,9 @@ void tcg_func_start(TCGContext *s)
     s->nb_labels = 0;
     s->current_frame_offset = s->frame_start;
 
-#ifdef CONFIG_DEBUG_TCG
     s->goto_tb_issue_mask = 0;
+#ifdef CONFIG_PLUGIN
+    s->fastdyn_const_pc_promoted = false;
 #endif
 
     QTAILQ_INIT(&s->ops);

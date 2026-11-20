@@ -318,9 +318,12 @@ void tcg_gen_plugin_cb(unsigned from)
     tcg_gen_op1(INDEX_op_plugin_cb, 0, from);
 }
 
-void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo)
+void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo, TCGType value_type,
+                           TCGTemp *value_low, TCGTemp *value_high)
 {
-    tcg_gen_op2(INDEX_op_plugin_mem_cb, 0, tcgv_i64_arg(addr), meminfo);
+    /* The op has a fixed input count. Narrow accesses use only value_low. */
+    tcg_gen_op4(INDEX_op_plugin_mem_cb, value_type, tcgv_i64_arg(addr),
+                temp_arg(value_low), temp_arg(value_high ?: value_low), meminfo);
 }
 
 /* 32 bit ops */
@@ -3231,11 +3234,9 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx)
     if (tb == NULL) {
         tcg_debug_assert(idx == 0);
     } else if (idx <= TB_EXIT_IDXMAX) {
-#ifdef CONFIG_DEBUG_TCG
         /* This is an exit following a goto_tb.  Verify that we have
            seen this numbered exit before, via tcg_gen_goto_tb.  */
         tcg_debug_assert(tcg_ctx->goto_tb_issue_mask & (1 << idx));
-#endif
     } else {
         /* This is an exit via the exitreq label.  */
         tcg_debug_assert(idx == TB_EXIT_REQUESTED);
@@ -3244,19 +3245,39 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx)
     tcg_gen_op1i(INDEX_op_exit_tb, 0, val);
 }
 
-void tcg_gen_goto_tb(unsigned idx)
+static void tcg_gen_goto_tb_internal(unsigned idx, bool plugin_cleanup)
 {
     /* We tested CF_NO_GOTO_TB in translator_use_goto_tb. */
     tcg_debug_assert(!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_TB));
     /* We only support two chained exits.  */
     tcg_debug_assert(idx <= TB_EXIT_IDXMAX);
-#ifdef CONFIG_DEBUG_TCG
     /* Verify that we haven't seen this numbered exit before.  */
     tcg_debug_assert((tcg_ctx->goto_tb_issue_mask & (1 << idx)) == 0);
     tcg_ctx->goto_tb_issue_mask |= 1 << idx;
-#endif
-    plugin_gen_disable_mem_helpers();
+    if (plugin_cleanup) {
+        plugin_gen_disable_mem_helpers();
+    }
     tcg_gen_op1i(INDEX_op_goto_tb, 0, idx);
+}
+
+void tcg_gen_goto_tb(unsigned idx)
+{
+    tcg_gen_goto_tb_internal(idx, true);
+}
+
+void tcg_gen_goto_tb_plugin(unsigned idx)
+{
+    tcg_gen_goto_tb_internal(idx, false);
+}
+
+int tcg_get_unused_goto_tb_slot(void)
+{
+    for (unsigned int idx = 0; idx <= TB_EXIT_IDXMAX; idx++) {
+        if (!(tcg_ctx->goto_tb_issue_mask & (1 << idx))) {
+            return idx;
+        }
+    }
+    return -1;
 }
 
 void tcg_gen_lookup_and_goto_ptr(void)

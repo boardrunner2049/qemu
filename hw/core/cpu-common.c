@@ -366,6 +366,20 @@ static int64_t cpu_common_get_arch_id(CPUState *cpu)
     return cpu->cpu_index;
 }
 
+bool fastdyn_read_saved_pc(CPUState *cpu, uint64_t *value)
+{
+    CPUClass *cc;
+
+    if (!cpu || !value) {
+        return false;
+    }
+    cc = cpu->cc;
+    if (!cc || !cc->fastdyn_read_saved_pc) {
+        return false;
+    }
+    return cc->fastdyn_read_saved_pc(cpu, value);
+}
+
 static void cpu_common_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);

@@ -22,6 +22,7 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/qemu-print.h"
+#include "qemu/qemu-plugin.h"
 #include "qom/object.h"
 #include "trace.h"
 #include "system/ram_addr.h"
@@ -30,6 +31,7 @@
 #include "system/tcg.h"
 #include "qemu/accel.h"
 #include "hw/boards.h"
+#include "hw/core/cpu.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 
@@ -68,28 +70,109 @@ typedef struct unimp_exporter {
 
 
 static DEV_XPORTER exporter;
+static qemu_plugin_unimp_ops_v2 exporter_v2;
+
+typedef enum UnimpExporterVersion {
+    UNIMP_EXPORTER_NONE,
+    UNIMP_EXPORTER_LEGACY,
+    UNIMP_EXPORTER_V2,
+} UnimpExporterVersion;
+
+static UnimpExporterVersion exporter_version;
 
 void unimp_export_device(void * arg);
+bool unimp_export_device_v2(const qemu_plugin_unimp_ops_v2 *ops);
 bool qemu_plugin_unimp_read(const char *name, hwaddr addr, uint64_t *val, unsigned size);
 bool qemu_plugin_unimp_write(const char *name, hwaddr addr, uint64_t val, unsigned size);
 
 void unimp_export_device(void * arg) {
     DEV_XPORTER * in_ops = (DEV_XPORTER *) arg;
     memcpy(&exporter, (uint8_t *)in_ops, sizeof(DEV_XPORTER));
+    memset(&exporter_v2, 0, sizeof(exporter_v2));
+    exporter_version = UNIMP_EXPORTER_LEGACY;
+}
+
+bool unimp_export_device_v2(const qemu_plugin_unimp_ops_v2 *ops)
+{
+    qemu_plugin_unimp_ops_v2 new_ops = { 0 };
+
+    if (!ops || ops->abi_version != QEMU_PLUGIN_UNIMP_ABI_V2 ||
+        ops->struct_size < sizeof(*ops)) {
+        return false;
+    }
+    if (!ops->read || !ops->write) {
+        return false;
+    }
+
+    new_ops.abi_version = ops->abi_version;
+    new_ops.struct_size = sizeof(new_ops);
+    new_ops.read = ops->read;
+    new_ops.write = ops->write;
+
+    exporter_v2 = new_ops;
+    memset(&exporter, 0, sizeof(exporter));
+    exporter_version = UNIMP_EXPORTER_V2;
+    return true;
+}
+
+static bool unimp_has_read(void)
+{
+    return (exporter_version == UNIMP_EXPORTER_V2 && exporter_v2.read) ||
+           (exporter_version == UNIMP_EXPORTER_LEGACY && exporter.read);
+}
+
+static bool unimp_has_write(void)
+{
+    return (exporter_version == UNIMP_EXPORTER_V2 && exporter_v2.write) ||
+           (exporter_version == UNIMP_EXPORTER_LEGACY && exporter.write);
+}
+
+static int unimp_invoke_read(const char *name, uint64_t addr,
+                             uint64_t *val, uint64_t size)
+{
+    if (exporter_version == UNIMP_EXPORTER_V2 && exporter_v2.read) {
+        qemu_plugin_mmio_context context = { 0 };
+
+        if (fastdyn_read_saved_pc(first_cpu, &context.saved_pc)) {
+            context.flags |= QEMU_PLUGIN_MMIO_SAVED_PC_VALID;
+        }
+        return exporter_v2.read(name, addr, val, size, &context);
+    }
+    if (exporter_version == UNIMP_EXPORTER_LEGACY && exporter.read) {
+        return exporter.read(name, addr, val, size);
+    }
+    return 1;
+}
+
+static int unimp_invoke_write(const char *name, uint64_t addr,
+                              uint64_t val, uint64_t size)
+{
+    if (exporter_version == UNIMP_EXPORTER_V2 && exporter_v2.write) {
+        qemu_plugin_mmio_context context = { 0 };
+
+        if (fastdyn_read_saved_pc(first_cpu, &context.saved_pc)) {
+            context.flags |= QEMU_PLUGIN_MMIO_SAVED_PC_VALID;
+        }
+        return exporter_v2.write(name, addr, val, size, &context);
+    }
+    if (exporter_version == UNIMP_EXPORTER_LEGACY && exporter.write) {
+        return exporter.write(name, addr, val, size);
+    }
+    return 1;
 }
 
 bool qemu_plugin_unimp_read(const char *name, hwaddr addr, uint64_t *val, unsigned size)
 {
-    if (exporter.read) {
-        return exporter.read(name, addr, val, size) == 0;
+    if (unimp_has_read()) {
+        return unimp_invoke_read(name, addr, val, size) == 0;
     }
     return false;
 }
 
 bool qemu_plugin_unimp_write(const char *name, hwaddr addr, uint64_t val, unsigned size)
 {
-    if (exporter.write) {
-        return exporter.write(name, addr, val, size) == 0;
+    if (unimp_has_write()) {
+        return unimp_invoke_write(name, addr, val, size) == 0;
     }
     return false;
 }
@@ -468,8 +551,8 @@ static MemTxResult  memory_region_read_accessor(MemoryRegion *mr,
     uint64_t tmp;
 	int bypass = 0;
 
-	if (exporter.read && !mr->subpage) {
-        if (!exporter.read(mr->name, (mr->addr + addr), &tmp, size)) {
+	if (unimp_has_read() && !mr->subpage) {
+        if (!unimp_invoke_read(mr->name, (mr->addr + addr), &tmp, size)) {
                 bypass = 1;
         }
     }
@@ -500,8 +583,8 @@ static MemTxResult memory_region_read_with_attrs_accessor(MemoryRegion *mr,
 	int bypass =0;
     MemTxResult r = 0;
 
-	if (exporter.read && !mr->subpage) {
-			if (!exporter.read(mr->name, (mr->addr + addr), &tmp, size)) {
+	if (unimp_has_read() && !mr->subpage) {
+			if (!unimp_invoke_read(mr->name, (mr->addr + addr), &tmp, size)) {
 					bypass= 1;
 			}
 	}
@@ -538,8 +621,8 @@ static MemTxResult memory_region_write_accessor(MemoryRegion *mr,
                                       memory_region_name(mr));
     }
 
-	if (exporter.write && !mr->subpage) {
-        if (!exporter.write(mr->name, (mr->addr + addr), tmp, size)) {
+	if (unimp_has_write() && !mr->subpage) {
+        if (!unimp_invoke_write(mr->name, (mr->addr + addr), tmp, size)) {
                bypass= 1;
         }
     }
@@ -565,8 +648,8 @@ static MemTxResult memory_region_write_with_attrs_accessor(MemoryRegion *mr,
         trace_memory_region_ops_write(get_cpu_index(), mr, abs_addr, tmp, size,
                                       memory_region_name(mr));
     }
-	if (exporter.write && !mr->subpage) {
-			if (!exporter.write(mr->name, (mr->addr + addr), tmp, size)) {
+	if (unimp_has_write() && !mr->subpage) {
+			if (!unimp_invoke_write(mr->name, (mr->addr + addr), tmp, size)) {
 					return 0;
 			}
 	}
