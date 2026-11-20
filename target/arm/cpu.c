@@ -2778,6 +2778,7 @@ static void arm_cpu_class_init(ObjectClass *oc, const void *data)
     cc->dump_state = arm_cpu_dump_state;
     cc->set_pc = arm_cpu_set_pc;
     cc->get_pc = arm_cpu_get_pc;
+    cc->fastdyn_read_saved_pc = arm_cpu_read_saved_pc;
     cc->gdb_read_register = arm_cpu_gdb_read_register;
     cc->gdb_write_register = arm_cpu_gdb_write_register;
 #ifndef CONFIG_USER_ONLY

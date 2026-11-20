@@ -159,6 +159,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
  */
 bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
 
+/* Emit the state normally restored by cpu_tb_exec() between TBs. */
+void translator_set_can_do_io(bool val);
+
 /**
  * translator_io_start
  * @db: Disassembly context

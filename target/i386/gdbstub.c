@@ -114,6 +114,24 @@ static int gdb_get_reg(CPUX86State *env, GByteArray *mem_buf, target_ulong val)
     }
 }
 
+static uint64_t x86_gdb_pc_value(CPUX86State *env)
+{
+#ifdef TARGET_X86_64
+    if (!(env->hflags & HF_CS64_MASK)) {
+        return env->eip & 0xffffffffUL;
+    }
+#endif
+    return env->eip;
+}
+
+bool x86_cpu_read_saved_pc(CPUState *cs, uint64_t *value)
+{
+    X86CPU *cpu = X86_CPU(cs);
+
+    *value = x86_gdb_pc_value(&cpu->env);
+    return true;
+}
+
 int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 {
     X86CPU *cpu = X86_CPU(cs);
@@ -155,7 +173,7 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
     } else {
         switch (n) {
         case IDX_IP_REG:
-            return gdb_get_reg(env, mem_buf, env->eip);
+            return gdb_get_reg(env, mem_buf, x86_gdb_pc_value(env));
         case IDX_FLAGS_REG:
             return gdb_get_reg32(mem_buf, env->eflags);
 

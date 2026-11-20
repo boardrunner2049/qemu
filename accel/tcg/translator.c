@@ -21,7 +21,7 @@
 #include "disas/disas.h"
 #include "tb-internal.h"
 
-static void set_can_do_io(DisasContextBase *db, bool val)
+void translator_set_can_do_io(bool val)
 {
     QEMU_BUILD_BUG_ON(sizeof_field(CPUState, neg.can_do_io) != 1);
     tcg_gen_st8_i32(tcg_constant_i32(val), tcg_env,
@@ -214,10 +214,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     } else {
         tcg_debug_assert(first_insn_start != db->insn_start);
         tcg_ctx->emit_before_op = first_insn_start;
-        set_can_do_io(db, false);
+        translator_set_can_do_io(false);
     }
     tcg_ctx->emit_before_op = db->insn_start;
-    set_can_do_io(db, true);
+    translator_set_can_do_io(true);
     tcg_ctx->emit_before_op = NULL;
 
     /* May be used by disas_log or plugin callbacks. */

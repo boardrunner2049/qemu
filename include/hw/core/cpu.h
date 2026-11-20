@@ -121,6 +121,9 @@ struct SysemuCPUOps;
  *       also implement the synchronize_from_tb hook.
  * @get_pc: Callback for getting the Program Counter register.
  *       As above, with the semantics of the target architecture.
+ * @fastdyn_read_saved_pc: Read the scalar representation of the PC register
+ *       exposed by this CPU's selected core GDB register interface.  This is
+ *       intentionally distinct from the execution-address @get_pc hook.
  * @gdb_read_register: Callback for letting GDB read a register.
  *                     No more than @gdb_num_core_regs registers can be read.
  * @gdb_write_register: Callback for letting GDB write a register.
@@ -164,6 +167,7 @@ struct CPUClass {
     int64_t (*get_arch_id)(CPUState *cpu);
     void (*set_pc)(CPUState *cpu, vaddr value);
     vaddr (*get_pc)(CPUState *cpu);
+    bool (*fastdyn_read_saved_pc)(CPUState *cpu, uint64_t *value);
     int (*gdb_read_register)(CPUState *cpu, GByteArray *buf, int reg);
     int (*gdb_write_register)(CPUState *cpu, uint8_t *buf, int reg);
     vaddr (*gdb_adjust_breakpoint)(CPUState *cpu, vaddr addr);
@@ -196,6 +200,8 @@ struct CPUClass {
     int gdb_num_core_regs;
     bool gdb_stop_before_watchpoint;
 };
+
+bool fastdyn_read_saved_pc(CPUState *cpu, uint64_t *value);
 
 /*
  * Fix the number of mmu modes to 16, which is also the maximum

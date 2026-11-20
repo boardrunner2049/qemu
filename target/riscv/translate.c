@@ -24,6 +24,7 @@
 #include "exec/helper-gen.h"
 #include "exec/target_page.h"
 #include "exec/translator.h"
+#include "exec/fastdyn-fragments.h"
 #include "exec/translation-block.h"
 #include "exec/log.h"
 #include "semihosting/semihost.h"
@@ -1217,7 +1218,9 @@ const RISCVDecoder decoder_table[] = {
 
 const size_t decoder_table_size = ARRAY_SIZE(decoder_table);
 
-static void decode_opc(CPURISCVState *env, DisasContext *ctx, uint16_t opcode)
+static void decode_opc_full(CPURISCVState *env, DisasContext *ctx,
+                            uint16_t opcode, uint32_t supplied,
+                            bool from_fragment)
 {
     ctx->virt_inst_excp = false;
     ctx->cur_insn_len = insn_len(opcode);
@@ -1233,10 +1236,12 @@ static void decode_opc(CPURISCVState *env, DisasContext *ctx, uint16_t opcode)
             return;
         }
     } else {
-        uint32_t opcode32 = opcode;
-        opcode32 = deposit32(opcode32, 16, 16,
-                             translator_lduw(env, &ctx->base,
-                                             ctx->base.pc_next + 2));
+        uint32_t opcode32 = from_fragment ? supplied : opcode;
+        if (!from_fragment) {
+            opcode32 = deposit32(opcode32, 16, 16,
+                                 translator_lduw(env, &ctx->base,
+                                                 ctx->base.pc_next + 2));
+        }
         ctx->opcode = opcode32;
 
         for (guint i = 0; i < ctx->decoders->len; ++i) {
@@ -1248,6 +1253,121 @@ static void decode_opc(CPURISCVState *env, DisasContext *ctx, uint16_t opcode)
     }
 
     gen_exception_illegal(ctx);
+}
+
+static void decode_opc(CPURISCVState *env, DisasContext *ctx, uint16_t opcode)
+{
+    decode_opc_full(env, ctx, opcode, 0, false);
+}
+
+static bool fastdyn_riscv_scalar(uint32_t insn, unsigned len, bool rv64)
+{
+    unsigned op, funct3, funct7;
+
+    if (len == 2) {
+        unsigned q = insn & 3;
+        funct3 = extract32(insn, 13, 3);
+        if (q == 0) {
+            return funct3 == 0;             /* c.addi4spn */
+        }
+        if (q == 1) {
+            if (funct3 <= 3) {              /* addi/addiw, li, lui */
+                return funct3 != 1 || rv64;
+            }
+            return funct3 == 4;             /* shifts/andi/register ALU */
+        }
+        if (q == 2) {
+            if (funct3 == 0) {              /* c.slli */
+                return true;
+            }
+            if (funct3 == 4) {              /* c.mv/c.add, not jr/jalr */
+                return extract32(insn, 2, 5) != 0;
+            }
+        }
+        return false;
+    }
+
+    op = insn & 0x7f;
+    funct3 = extract32(insn, 12, 3);
+    funct7 = extract32(insn, 25, 7);
+    switch (op) {
+    case 0x37:                              /* lui */
+        return true;
+    case 0x13:                              /* OP-IMM */
+        if (funct3 == 1) {
+            return rv64 ? !(funct7 & ~1u) : funct7 == 0;
+        }
+        if (funct3 == 5) {
+            return rv64 ? !(funct7 & ~0x21u) :
+                          (funct7 == 0 || funct7 == 0x20);
+        }
+        return true;
+    case 0x33:                              /* base OP, excluding M */
+        return funct7 == 0 ||
+               (funct7 == 0x20 && (funct3 == 0 || funct3 == 5));
+    case 0x1b:                              /* RV64 OP-IMM-32 */
+        return rv64 && (funct3 == 0 ||
+               (funct3 == 1 && funct7 == 0) ||
+               (funct3 == 5 && (funct7 == 0 || funct7 == 0x20)));
+    case 0x3b:                              /* RV64 OP-32 */
+        return rv64 && (funct7 == 0 ||
+               (funct7 == 0x20 && (funct3 == 0 || funct3 == 5)));
+    default:
+        return false;
+    }
+}
+
+static void fastdyn_emit_riscv_fragments(CPURISCVState *env,
+                                         DisasContext *ctx,
+                                         target_ulong pc)
+{
+    FastDynCodeMode mode = get_xl(ctx) == MXL_RV32 ?
+        FASTDYN_CODE_MODE_RV32 : FASTDYN_CODE_MODE_RV64;
+    const FastDynFragment *fragment;
+    size_t cursor = 0, combined_insns = 0, combined_bytes = 0;
+
+    while ((fragment = fastdyn_fragment_find(pc, FASTDYN_GUEST_ISA_RISCV,
+                    mode, FASTDYN_INSN_ORDER_LITTLE_ENDIAN, &cursor))) {
+        size_t off = 0;
+        while (off < fragment->code_size) {
+            uint16_t lo;
+            uint32_t insn;
+            unsigned len;
+            DisasJumpType old_jmp = ctx->base.is_jmp;
+
+            if (fragment->code_size - off < 2) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "truncated instruction");
+            }
+            lo = lduw_le_p(fragment->code + off);
+            len = insn_len(lo);
+            if ((len != 2 && len != 4) || fragment->code_size - off < len) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "unsupported or truncated length");
+            }
+            insn = len == 2 ? lo : ldl_le_p(fragment->code + off);
+            if (!fastdyn_riscv_scalar(insn, len, mode == FASTDYN_CODE_MODE_RV64)) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "not in scalar register subset");
+            }
+            if (len == 2 && !(has_ext(ctx, RVC) || ctx->cfg_ptr->ext_zca)) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "compressed extension is disabled");
+            }
+            if (++combined_insns > FASTDYN_FRAGMENT_MAX_INSNS ||
+                (combined_bytes += len) > FASTDYN_FRAGMENT_MAX_BYTES) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "combined site limit exceeded");
+            }
+            ctx->ol = ctx->xl;
+            decode_opc_full(env, ctx, lo, insn, true);
+            if (ctx->base.is_jmp != old_jmp) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "decoder changed control flow");
+            }
+            off += len;
+        }
+    }
 }
 
 static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
@@ -1321,6 +1441,7 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     CPURISCVState *env = cpu_env(cpu);
     uint16_t opcode16 = translator_lduw(env, &ctx->base, ctx->base.pc_next);
 
+    fastdyn_emit_riscv_fragments(env, ctx, ctx->base.pc_next);
     ctx->ol = ctx->xl;
     decode_opc(env, ctx, opcode16);
     ctx->base.pc_next += ctx->cur_insn_len;

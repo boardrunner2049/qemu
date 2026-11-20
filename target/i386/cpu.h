@@ -2385,6 +2385,7 @@ bool x86_cpu_get_memory_mapping(CPUState *cpu, MemoryMappingList *list,
 void x86_cpu_dump_state(CPUState *cs, FILE *f, int flags);
 
 int x86_cpu_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg);
+bool x86_cpu_read_saved_pc(CPUState *cpu, uint64_t *value);
 int x86_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
 void x86_cpu_gdb_init(CPUState *cs);
 

@@ -64,6 +64,12 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx);
  */
 void tcg_gen_goto_tb(unsigned idx);
 
+/* Late plugin injection has already passed plugin cleanup markers. */
+void tcg_gen_goto_tb_plugin(unsigned idx);
+
+/* Return an unclaimed outgoing slot, or -1 if both are owned. */
+int tcg_get_unused_goto_tb_slot(void);
+
 /**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid
  * @addr: Guest address of the target TB
@@ -76,7 +82,8 @@ void tcg_gen_goto_tb(unsigned idx);
 void tcg_gen_lookup_and_goto_ptr(void);
 
 void tcg_gen_plugin_cb(unsigned from);
-void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
+void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo, TCGType value_type,
+                           TCGTemp *value_low, TCGTemp *value_high);
 
 /* 32 bit ops */
 

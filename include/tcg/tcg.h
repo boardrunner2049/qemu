@@ -377,8 +377,9 @@ struct TCGContext {
     tcg_insn_unit *code_buf;      /* pointer for start of tb */
     tcg_insn_unit *code_ptr;      /* pointer for running end of tb */
 
+    /* Outgoing slots are translation state, not only debug bookkeeping. */
+    unsigned int goto_tb_issue_mask;
 #ifdef CONFIG_DEBUG_TCG
-    int goto_tb_issue_mask;
     const TCGOpcode *vecop_list;
 #endif
 
@@ -416,6 +417,9 @@ struct TCGContext {
 
     /* descriptor of the instruction being translated */
     struct qemu_plugin_insn *plugin_insn;
+
+    /* Only one FastDyn fixed-PC redirect may claim a slot in this TB. */
+    bool fastdyn_const_pc_promoted;
 #endif
 
     /* For host-specific values. */

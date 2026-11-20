@@ -2655,6 +2655,7 @@ static void riscv_cpu_common_class_init(ObjectClass *c, const void *data)
     cc->dump_state = riscv_cpu_dump_state;
     cc->set_pc = riscv_cpu_set_pc;
     cc->get_pc = riscv_cpu_get_pc;
+    cc->fastdyn_read_saved_pc = riscv_cpu_read_saved_pc;
     cc->gdb_read_register = riscv_cpu_gdb_read_register;
     cc->gdb_write_register = riscv_cpu_gdb_write_register;
     cc->gdb_stop_before_watchpoint = true;

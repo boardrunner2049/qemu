@@ -9416,6 +9416,7 @@ static void x86_cpu_common_class_init(ObjectClass *oc, const void *data)
     cc->dump_state = x86_cpu_dump_state;
     cc->set_pc = x86_cpu_set_pc;
     cc->get_pc = x86_cpu_get_pc;
+    cc->fastdyn_read_saved_pc = x86_cpu_read_saved_pc;
     cc->gdb_read_register = x86_cpu_gdb_read_register;
     cc->gdb_write_register = x86_cpu_gdb_write_register;
     cc->get_arch_id = x86_cpu_get_arch_id;

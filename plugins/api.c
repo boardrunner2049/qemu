@@ -53,6 +53,11 @@
 #include "tcg/supercache.h"
 #include "system/cpu-timers-internal.h"
 
+int qemu_plugin_fastdyn_const_pc_chain_version(void)
+{
+    return 1;
+}
+
 /* Uninstall and Reset handlers */
 
 void qemu_plugin_uninstall(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)

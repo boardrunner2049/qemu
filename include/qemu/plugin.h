@@ -76,7 +76,8 @@ enum plugin_dyn_cb_type {
 	PLUGIN_CB_INLINE_UPDATE_MEM,
 	PLUGIN_CB_INLINE_LOG_REG,
 	PLUGIN_CB_INLINE_STORE_IO,
-	PLUGIN_CB_INLINE_LOAD_IO
+	PLUGIN_CB_INLINE_LOAD_IO,
+	PLUGIN_CB_INLINE_CONST_REG
 };
 
 struct qemu_plugin_regular_cb {
@@ -125,6 +126,9 @@ struct qemu_plugin_insn {
 
     /* if set, the instruction calls helpers that might access guest memory */
     bool mem_helper;
+
+    /* Target-owned facts captured at this instruction's translation point. */
+    uint64_t fastdyn_const_pc_state;
 };
 
 /* A scoreboard is an array of values, indexed by vcpu_index */

@@ -1180,6 +1180,7 @@ hwaddr arm_cpu_get_phys_page_attrs_debug(CPUState *cpu, vaddr addr,
 #endif /* !CONFIG_USER_ONLY */
 
 int arm_cpu_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg);
+bool arm_cpu_read_saved_pc(CPUState *cpu, uint64_t *value);
 int arm_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
 
 int arm_cpu_write_elf64_note(WriteCoreDumpFunction f, CPUState *cs,

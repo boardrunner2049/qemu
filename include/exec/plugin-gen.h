@@ -16,6 +16,20 @@
 
 struct DisasContextBase;
 
+/* Common bits in the otherwise target-owned per-instruction state. */
+#define FASTDYN_CONST_PC_SUPPORTED          (1ULL << 0)
+#define FASTDYN_CONST_PC_NEEDS_PAGE_GUARD   (1ULL << 1)
+
+uint64_t fastdyn_const_pc_insn_state(const struct DisasContextBase *db);
+bool fastdyn_const_pc_target_is_pc_reg(uint64_t reg);
+bool fastdyn_const_pc_target_eligible(uint64_t state, uint64_t source_pc,
+                                     uint64_t destination);
+void fastdyn_const_pc_target_emit(uint64_t state, uint64_t destination,
+                                  uint64_t expected_page,
+                                  TCGLabel *fallback);
+void fastdyn_const_pc_target_emit_legacy(uint64_t destination,
+                                         TCGLabel *fallback);
+
 #ifdef CONFIG_PLUGIN
 
 bool plugin_gen_tb_start(CPUState *cpu, const struct DisasContextBase *db);

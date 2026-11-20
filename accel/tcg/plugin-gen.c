@@ -40,6 +40,76 @@ enum plugin_gen_from {
     PLUGIN_GEN_AFTER_TB,
 };
 
+uint64_t __attribute__((weak))
+fastdyn_const_pc_insn_state(const DisasContextBase *db)
+{
+    (void)db;
+    return 0;
+}
+
+bool __attribute__((weak)) fastdyn_const_pc_target_is_pc_reg(uint64_t reg)
+{
+    (void)reg;
+    return false;
+}
+
+bool __attribute__((weak))
+fastdyn_const_pc_target_eligible(uint64_t state, uint64_t source_pc,
+                                uint64_t destination)
+{
+    (void)state;
+    (void)source_pc;
+    (void)destination;
+    return false;
+}
+
+void __attribute__((weak))
+fastdyn_const_pc_target_emit(uint64_t state, uint64_t destination,
+                             uint64_t expected_page, TCGLabel *fallback)
+{
+    (void)state;
+    (void)destination;
+    (void)expected_page;
+    (void)fallback;
+    g_assert_not_reached();
+}
+
+void __attribute__((weak))
+fastdyn_const_pc_target_emit_legacy(uint64_t destination, TCGLabel *fallback)
+{
+    (void)destination;
+    (void)fallback;
+    g_assert_not_reached();
+}
+
+static bool fastdyn_const_pc_enabled(void)
+{
+    static gsize initialized;
+    static bool enabled;
+
+    if (g_once_init_enter(&initialized)) {
+        const char *value = g_getenv("FASTDYN_CONST_PC_CHAIN");
+
+        enabled = value == NULL || strcmp(value, "0") != 0;
+        g_once_init_leave(&initialized, 1);
+    }
+    return enabled;
+}
+
+static bool fastdyn_const_pc_trace_enabled(void)
+{
+    static gsize initialized;
+    static bool enabled;
+
+    if (g_once_init_enter(&initialized)) {
+        const char *value = g_getenv("FASTDYN_CONST_PC_CHAIN_TRACE");
+
+        enabled = value != NULL && strcmp(value, "0") != 0;
+        g_once_init_leave(&initialized, 1);
+    }
+    return enabled;
+}
+
 /* called before finishing a TB with exit_tb, goto_tb or goto_ptr */
 void plugin_gen_disable_mem_helpers(void)
 {
@@ -297,6 +367,148 @@ void gen_inline_update_pc_cb(struct qemu_plugin_inline_cb *cb) {
 	}
 }
 
+static bool fastdyn_const_pc_cb_is_safe(const struct qemu_plugin_dyn_cb *cb)
+{
+    switch (cb->type) {
+    case PLUGIN_CB_INLINE_ADD_U64:
+    case PLUGIN_CB_INLINE_STORE_U64:
+    case PLUGIN_CB_INLINE_LOG_REG:
+        return true;
+    case PLUGIN_CB_INLINE_UPDATE_REG:
+    case PLUGIN_CB_INLINE_CONST_REG:
+        return !fastdyn_const_pc_target_is_pc_reg(cb->inline_insn.imm);
+    default:
+        return false;
+    }
+}
+
+static bool fastdyn_const_pc_prefix_is_safe(struct qemu_plugin_tb *plugin_tb,
+                                            int insn_idx, int cb_idx)
+{
+    const GArray *cbs = plugin_tb->cbs;
+
+    for (int i = 0, n = cbs ? cbs->len : 0; i < n; i++) {
+        if (!fastdyn_const_pc_cb_is_safe(
+                &g_array_index(cbs, struct qemu_plugin_dyn_cb, i))) {
+            return false;
+        }
+    }
+
+    for (int i = 0; i <= insn_idx; i++) {
+        struct qemu_plugin_insn *insn =
+            g_ptr_array_index(plugin_tb->insns, i);
+        int limit;
+
+        if (i < insn_idx && insn->mem_cbs && insn->mem_cbs->len) {
+            return false;
+        }
+        cbs = insn->insn_cbs;
+        limit = i == insn_idx ? cb_idx : (cbs ? cbs->len : 0);
+        for (int j = 0; j < limit; j++) {
+            if (!fastdyn_const_pc_cb_is_safe(
+                    &g_array_index(cbs, struct qemu_plugin_dyn_cb, j))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool fastdyn_const_pc_has_later_legacy_pc(
+    const struct qemu_plugin_insn *insn, int cb_idx)
+{
+    const GArray *cbs = insn->insn_cbs;
+
+    for (int i = cb_idx + 1, n = cbs ? cbs->len : 0; i < n; i++) {
+        const struct qemu_plugin_dyn_cb *cb =
+            &g_array_index(cbs, struct qemu_plugin_dyn_cb, i);
+
+        if (cb->type == PLUGIN_CB_INLINE_UPDATE_REG &&
+            fastdyn_const_pc_target_is_pc_reg(cb->inline_insn.imm)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool fastdyn_try_const_pc(struct qemu_plugin_inline_cb *cb,
+                                 struct qemu_plugin_tb *plugin_tb,
+                                 struct qemu_plugin_insn *insn,
+                                 int insn_idx, int cb_idx,
+                                 const char **fallback_reason)
+{
+    DisasContextBase *db = (DisasContextBase *)tcg_ctx->plugin_db;
+    uint64_t destination = cb->entry.offset;
+    uint64_t state;
+    TCGLabel *fallback = NULL;
+    int slot;
+
+    if (!fastdyn_const_pc_target_is_pc_reg(cb->imm)) {
+        *fallback_reason = "not-target-pc";
+        return false;
+    }
+    if (!fastdyn_const_pc_enabled()) {
+        *fallback_reason = "disabled";
+        return false;
+    }
+    if (plugin_tb == NULL || insn == NULL) {
+        *fallback_reason = "missing-instruction-context";
+        return false;
+    }
+    if (tcg_ctx->fastdyn_const_pc_promoted) {
+        *fallback_reason = "redirect-already-promoted";
+        return false;
+    }
+    state = insn->fastdyn_const_pc_state;
+    if (!fastdyn_const_pc_target_eligible(state, insn->vaddr, destination)) {
+        *fallback_reason = "target-state-or-address";
+        return false;
+    }
+    if (db->pc_next <= db->pc_first ||
+        !translator_is_same_page(db, db->pc_next - 1)) {
+        *fallback_reason = "multi-page-source";
+        return false;
+    }
+    if (!translator_use_goto_tb(db, destination)) {
+        *fallback_reason = "chaining-disabled-or-cross-page";
+        return false;
+    }
+    if (!fastdyn_const_pc_prefix_is_safe(plugin_tb, insn_idx, cb_idx)) {
+        *fallback_reason = "callback-overlap";
+        return false;
+    }
+    if (fastdyn_const_pc_has_later_legacy_pc(insn, cb_idx)) {
+        *fallback_reason = "legacy-pc-overlap";
+        return false;
+    }
+    slot = tcg_get_unused_goto_tb_slot();
+    if (slot < 0) {
+        *fallback_reason = "no-exit-slot";
+        return false;
+    }
+
+    if (state & FASTDYN_CONST_PC_NEEDS_PAGE_GUARD) {
+        fallback = gen_new_label();
+    }
+    fastdyn_const_pc_target_emit(state, destination,
+                                 destination & TARGET_PAGE_MASK, fallback);
+    gen_disable_mem_helper();
+    translator_set_can_do_io(true);
+    tcg_gen_goto_tb_plugin(slot);
+    tcg_gen_exit_tb(tcg_ctx->gen_tb, slot);
+    if (fallback) {
+        fastdyn_const_pc_target_emit_legacy(destination, fallback);
+    }
+    tcg_ctx->fastdyn_const_pc_promoted = true;
+    if (fastdyn_const_pc_trace_enabled()) {
+        fprintf(stderr,
+                "fastdyn-const-pc: promoted source=0x%" PRIx64
+                " destination=0x%" PRIx64 " slot=%d\n",
+                insn->vaddr, destination, slot);
+    }
+    return true;
+}
+
 //TODO:
 typedef struct {
     uint8_t *buffer;  // Pointer to the buffer
@@ -350,7 +562,10 @@ void gen_inline_update_mem_cb(struct qemu_plugin_inline_cb *cb) {
     tcg_temp_free_i32(val);
 }
 
-static void inject_cb(struct qemu_plugin_dyn_cb *cb)
+static void inject_cb_with_context(struct qemu_plugin_dyn_cb *cb,
+                                   struct qemu_plugin_tb *plugin_tb,
+                                   struct qemu_plugin_insn *insn,
+                                   int insn_idx, int cb_idx)
 
 {
     switch (cb->type) {
@@ -369,6 +584,24 @@ static void inject_cb(struct qemu_plugin_dyn_cb *cb)
 	case PLUGIN_CB_INLINE_UPDATE_REG:
 		gen_inline_update_pc_cb(&cb->inline_insn);
 		break;
+	case PLUGIN_CB_INLINE_CONST_REG:
+	{
+		const char *fallback_reason = "unknown";
+
+		if (!fastdyn_try_const_pc(&cb->inline_insn, plugin_tb, insn,
+		                           insn_idx, cb_idx, &fallback_reason)) {
+			if (fastdyn_const_pc_trace_enabled() &&
+			    fastdyn_const_pc_target_is_pc_reg(cb->inline_insn.imm)) {
+				fprintf(stderr,
+				        "fastdyn-const-pc: fallback source=0x%" PRIx64
+				        " destination=0x%zx reason=%s\n",
+				        insn ? insn->vaddr : 0,
+				        cb->inline_insn.entry.offset, fallback_reason);
+			}
+			update_reg(cb->inline_insn.imm, cb->inline_insn.entry.offset);
+		}
+		break;
+	}
 	case PLUGIN_CB_INLINE_UPDATE_MEM:
 		gen_inline_update_mem_cb(&cb->inline_insn);
 		break;
@@ -385,6 +618,11 @@ static void inject_cb(struct qemu_plugin_dyn_cb *cb)
     default:
         g_assert_not_reached();
     }
+}
+
+static void inject_cb(struct qemu_plugin_dyn_cb *cb)
+{
+    inject_cb_with_context(cb, NULL, NULL, -1, -1);
 }
 
 static void inject_mem_cb(struct qemu_plugin_dyn_cb *cb,
@@ -405,6 +643,26 @@ static void inject_mem_cb(struct qemu_plugin_dyn_cb *cb,
         break;
     default:
         g_assert_not_reached();
+    }
+}
+
+static void gen_mem_value(const TCGOp *op)
+{
+    TCGTemp *low = arg_temp(op->args[1]);
+    ptrdiff_t low_offset = offsetof(CPUState, neg.plugin_mem_value_low) -
+                           sizeof(CPUState);
+
+    if (TCGOP_TYPE(op) == TCG_TYPE_I32) {
+        tcg_gen_st_i32(temp_tcgv_i32(low), tcg_env,
+                       low_offset + HOST_BIG_ENDIAN * 4);
+    } else {
+        tcg_gen_st_i64(temp_tcgv_i64(low), tcg_env, low_offset);
+        if (TCGOP_TYPE(op) == TCG_TYPE_I128) {
+            TCGTemp *high = arg_temp(op->args[2]);
+            tcg_gen_st_i64(temp_tcgv_i64(high), tcg_env,
+                           offsetof(CPUState, neg.plugin_mem_value_high) -
+                           sizeof(CPUState));
+        }
     }
 }
 
@@ -481,8 +739,9 @@ static void plugin_gen_inject(struct qemu_plugin_tb *plugin_tb)
 
                 cbs = insn->insn_cbs;
                 for (i = 0, n = (cbs ? cbs->len : 0); i < n; i++) {
-                    inject_cb(
-                        &g_array_index(cbs, struct qemu_plugin_dyn_cb, i));
+                    inject_cb_with_context(
+                        &g_array_index(cbs, struct qemu_plugin_dyn_cb, i),
+                        plugin_tb, insn, insn_idx, i);
                 }
                 break;
 
@@ -498,7 +757,7 @@ static void plugin_gen_inject(struct qemu_plugin_tb *plugin_tb)
         case INDEX_op_plugin_mem_cb:
         {
             TCGv_i64 addr = temp_tcgv_i64(arg_temp(op->args[0]));
-            qemu_plugin_meminfo_t meminfo = op->args[1];
+            qemu_plugin_meminfo_t meminfo = op->args[3];
             enum qemu_plugin_mem_rw rw =
                 (qemu_plugin_mem_is_store(meminfo)
                  ? QEMU_PLUGIN_MEM_W : QEMU_PLUGIN_MEM_R);
@@ -512,9 +771,19 @@ static void plugin_gen_inject(struct qemu_plugin_tb *plugin_tb)
             tcg_ctx->emit_before_op = op;
 
             cbs = insn->mem_cbs;
+            bool have_value = false;
             for (i = 0, n = (cbs ? cbs->len : 0); i < n; i++) {
-                inject_mem_cb(&g_array_index(cbs, struct qemu_plugin_dyn_cb, i),
-                              rw, meminfo, addr);
+                struct qemu_plugin_dyn_cb *cb =
+                    &g_array_index(cbs, struct qemu_plugin_dyn_cb, i);
+
+                /* Inline callbacks use only their scoreboard. A regular
+                 * callback may read the value through the plugin API. */
+                if (!have_value && cb->type == PLUGIN_CB_MEM_REGULAR &&
+                    (rw & cb->regular.rw)) {
+                    gen_mem_value(op);
+                    have_value = true;
+                }
+                inject_mem_cb(cb, rw, meminfo, addr);
             }
 
             tcg_ctx->emit_before_op = NULL;
@@ -579,6 +848,7 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     tcg_ctx->plugin_insn = insn;
     insn->calls_helpers = false;
     insn->mem_helper = false;
+    insn->fastdyn_const_pc_state = fastdyn_const_pc_insn_state(db);
     if (insn->insn_cbs) {
         g_array_set_size(insn->insn_cbs, 0);
     }

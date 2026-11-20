@@ -47,6 +47,24 @@ static const struct TypeSize vec_lanes[] = {
     { "uint8", "bytes", 8, 'b' },
 };
 
+bool riscv_cpu_read_saved_pc(CPUState *cs, uint64_t *value)
+{
+    RISCVCPUClass *mcc = RISCV_CPU_GET_CLASS(cs);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+
+    switch (mcc->def->misa_mxl_max) {
+    case MXL_RV32:
+        *value = (uint32_t)cpu->env.pc;
+        return true;
+    case MXL_RV64:
+    case MXL_RV128:
+        *value = (uint64_t)cpu->env.pc;
+        return true;
+    default:
+        return false;
+    }
+}
+
 int riscv_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 {
     RISCVCPUClass *mcc = RISCV_CPU_GET_CLASS(cs);
@@ -57,7 +75,12 @@ int riscv_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
     if (n < 32) {
         tmp = env->gpr[n];
     } else if (n == 32) {
-        tmp = env->pc;
+        uint64_t pc;
+
+        if (!riscv_cpu_read_saved_pc(cs, &pc)) {
+            return 0;
+        }
+        tmp = pc;
     } else {
         return 0;
     }

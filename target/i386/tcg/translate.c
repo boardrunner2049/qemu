@@ -26,6 +26,7 @@
 #include "tcg/tcg-op-gvec.h"
 #include "tcg/tcg-temp-internal.h"
 #include "exec/translator.h"
+#include "exec/fastdyn-fragments.h"
 #include "exec/target_page.h"
 #include "fpu/softfloat.h"
 
@@ -142,6 +143,10 @@ typedef struct DisasContext {
     sigjmp_buf jmpbuf;
     TCGOp *prev_insn_start;
     TCGOp *prev_insn_end;
+
+    /* Bounded alternate byte source used only while emitting a fragment. */
+    const FastDynFragment *fastdyn_fragment;
+    size_t fastdyn_offset;
 } DisasContext;
 
 /*
@@ -1690,22 +1695,43 @@ static uint64_t advance_pc(CPUX86State *env, DisasContext *s, int num_bytes)
 
 static inline uint8_t x86_ldub_code(CPUX86State *env, DisasContext *s)
 {
+    if (s->fastdyn_fragment) {
+        if (s->fastdyn_offset >= s->fastdyn_fragment->code_size) {
+            fastdyn_fragment_translation_error(s->fastdyn_fragment,
+                                               s->fastdyn_offset,
+                                               "decoder read past fragment");
+        }
+        s->pc++;
+        return s->fastdyn_fragment->code[s->fastdyn_offset++];
+    }
     return translator_ldub(env, &s->base, advance_pc(env, s, 1));
 }
 
 static inline uint16_t x86_lduw_code(CPUX86State *env, DisasContext *s)
 {
+    if (s->fastdyn_fragment) {
+        uint16_t v = x86_ldub_code(env, s);
+        return v | (uint16_t)x86_ldub_code(env, s) << 8;
+    }
     return translator_lduw(env, &s->base, advance_pc(env, s, 2));
 }
 
 static inline uint32_t x86_ldl_code(CPUX86State *env, DisasContext *s)
 {
+    if (s->fastdyn_fragment) {
+        uint32_t lo = x86_lduw_code(env, s);
+        return lo | (uint32_t)x86_lduw_code(env, s) << 16;
+    }
     return translator_ldl(env, &s->base, advance_pc(env, s, 4));
 }
 
 #ifdef TARGET_X86_64
 static inline uint64_t x86_ldq_code(CPUX86State *env, DisasContext *s)
 {
+    if (s->fastdyn_fragment) {
+        uint64_t lo = x86_ldl_code(env, s);
+        return lo | (uint64_t)x86_ldl_code(env, s) << 32;
+    }
     return translator_ldq(env, &s->base, advance_pc(env, s, 8));
 }
 #endif
@@ -3754,6 +3780,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     int iopl = (flags >> IOPL_SHIFT) & 3;
 
     dc->cs_base = dc->base.tb->cs_base;
+    dc->fastdyn_fragment = NULL;
+    dc->fastdyn_offset = 0;
     dc->pc_save = dc->base.pc_next;
     dc->flags = flags;
 #ifndef CONFIG_USER_ONLY
@@ -3815,6 +3843,171 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     tcg_gen_insn_start(pc_arg, dc->cc_op);
 }
 
+static FastDynCodeMode fastdyn_x86_mode(DisasContext *s)
+{
+    if (CODE64(s)) {
+        return FASTDYN_CODE_MODE_X86_64;
+    }
+    return CODE32(s) ? FASTDYN_CODE_MODE_X86_32 : FASTDYN_CODE_MODE_X86_16;
+}
+
+/* Return the end of one admitted register-only scalar instruction. */
+static size_t fastdyn_x86_scalar_end(const FastDynFragment *f, size_t off,
+                                     FastDynCodeMode mode)
+{
+    size_t start = off;
+    bool p66 = false, rexw = false;
+    unsigned op, modrm = 0, ext = 0;
+    int opsize;
+    size_t imm = 0;
+    bool need_modrm = false;
+
+#define FD_BYTE() ((off < f->code_size) ? f->code[off++] : \
+    (fastdyn_fragment_translation_error(f, off, "truncated x86 instruction"), 0))
+    for (;;) {
+        op = FD_BYTE();
+        if (op == 0x66) {
+            p66 = true;
+            rexw = false; /* a legacy prefix after REX cancels that REX */
+            continue;
+        }
+        if (mode == FASTDYN_CODE_MODE_X86_64 && op >= 0x40 && op <= 0x4f) {
+            rexw = op & 8;
+            continue;
+        }
+        break;
+    }
+    opsize = mode == FASTDYN_CODE_MODE_X86_16 ? (p66 ? 4 : 2) :
+             mode == FASTDYN_CODE_MODE_X86_32 ? (p66 ? 2 : 4) :
+             rexw ? 8 : p66 ? 2 : 4;
+
+    if ((op & 0xf8) == 0xb0) {             /* mov r8, imm8 */
+        imm = 1;
+    } else if ((op & 0xf8) == 0xb8) {      /* mov r, imm */
+        imm = opsize;
+    } else if (op == 0x88 || op == 0x89 || op == 0x8a || op == 0x8b ||
+               op == 0x84 || op == 0x85) { /* mov/test register */
+        need_modrm = true;
+    } else if (((op & 0xf8) == 0x00 || (op & 0xf8) == 0x08 ||
+                (op & 0xf8) == 0x20 || (op & 0xf8) == 0x28 ||
+                (op & 0xf8) == 0x30 || (op & 0xf8) == 0x38) &&
+               (op & 7) <= 3) {            /* add/or/and/sub/xor/cmp */
+        need_modrm = true;
+    } else if (op == 0x04 || op == 0x0c || op == 0x24 || op == 0x2c ||
+               op == 0x34 || op == 0x3c) {
+        imm = 1;
+    } else if (op == 0x05 || op == 0x0d || op == 0x25 || op == 0x2d ||
+               op == 0x35 || op == 0x3d) {
+        imm = rexw ? 4 : opsize;
+    } else if (op == 0x80 || op == 0x81 || op == 0x83 ||
+               op == 0xc6 || op == 0xc7 || op == 0xf6 || op == 0xf7 ||
+               op == 0xc0 || op == 0xc1 || op == 0xd0 || op == 0xd1) {
+        need_modrm = true;
+        modrm = FD_BYTE();
+        ext = (modrm >> 3) & 7;
+        if ((modrm >> 6) != 3) {
+            fastdyn_fragment_translation_error(f, start, "x86 memory operand");
+        }
+        if (op == 0x80 || op == 0x81 || op == 0x83) {
+            if (!(ext == 0 || ext == 1 || ext == 4 || ext == 5 ||
+                  ext == 6 || ext == 7)) {
+                fastdyn_fragment_translation_error(f, start, "unsupported group-1 operation");
+            }
+            imm = op == 0x81 ? (rexw ? 4 : opsize) : 1;
+        } else if (op == 0xc6 || op == 0xc7) {
+            if (ext != 0) {
+                fastdyn_fragment_translation_error(f, start, "invalid MOV immediate extension");
+            }
+            imm = op == 0xc6 ? 1 : rexw ? 4 : opsize;
+        } else if (op == 0xf6 || op == 0xf7) {
+            if (ext != 0) {
+                fastdyn_fragment_translation_error(f, start, "unsupported TEST group operation");
+            }
+            imm = op == 0xf6 ? 1 : rexw ? 4 : opsize;
+        } else {
+            if (!(ext == 4 || ext == 5 || ext == 7)) {
+                fastdyn_fragment_translation_error(f, start, "unsupported shift operation");
+            }
+            imm = (op == 0xc0 || op == 0xc1) ? 1 : 0;
+        }
+        need_modrm = false;
+    } else if (op == 0x0f) {
+        op = FD_BYTE();
+        if (!(op == 0xb6 || op == 0xb7 || op == 0xbe || op == 0xbf)) {
+            fastdyn_fragment_translation_error(f, start, "unsupported 0F opcode");
+        }
+        need_modrm = true;                  /* movzx/movsx */
+    } else if (op == 0x63 && mode == FASTDYN_CODE_MODE_X86_64) {
+        need_modrm = true;                  /* movsxd */
+    } else {
+        fastdyn_fragment_translation_error(f, start, "opcode outside scalar subset");
+    }
+
+    if (need_modrm) {
+        modrm = FD_BYTE();
+        if ((modrm >> 6) != 3) {
+            fastdyn_fragment_translation_error(f, start, "x86 memory operand");
+        }
+    }
+    if (f->code_size - off < imm) {
+        fastdyn_fragment_translation_error(f, off, "truncated x86 immediate");
+    }
+    off += imm;
+    if (off - start > X86_MAX_INSN_LENGTH) {
+        fastdyn_fragment_translation_error(f, start, "x86 instruction exceeds 15 bytes");
+    }
+#undef FD_BYTE
+    return off;
+}
+
+static void fastdyn_emit_x86_fragments(DisasContext *s, CPUState *cpu)
+{
+    FastDynCodeMode mode = fastdyn_x86_mode(s);
+    const FastDynFragment *fragment;
+    size_t cursor = 0, count = 0, bytes = 0;
+    target_ulong saved_pc = s->pc;
+    target_ulong saved_next = s->base.pc_next;
+    target_ulong saved_pc_save = s->pc_save;
+
+    /* Validate every matching byte before emitting any fragment operation. */
+    while ((fragment = fastdyn_fragment_find(saved_next, FASTDYN_GUEST_ISA_X86,
+                    mode, FASTDYN_INSN_ORDER_LITTLE_ENDIAN, &cursor))) {
+        size_t off = 0;
+        while (off < fragment->code_size) {
+            size_t end = fastdyn_x86_scalar_end(fragment, off, mode);
+            if (++count > FASTDYN_FRAGMENT_MAX_INSNS ||
+                (bytes += end - off) > FASTDYN_FRAGMENT_MAX_BYTES) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "combined site limit exceeded");
+            }
+            off = end;
+        }
+    }
+
+    cursor = 0;
+    while ((fragment = fastdyn_fragment_find(saved_next, FASTDYN_GUEST_ISA_X86,
+                    mode, FASTDYN_INSN_ORDER_LITTLE_ENDIAN, &cursor))) {
+        size_t off = 0;
+        while (off < fragment->code_size) {
+            size_t end = fastdyn_x86_scalar_end(fragment, off, mode);
+            DisasJumpType old_jmp = s->base.is_jmp;
+            s->fastdyn_fragment = fragment;
+            s->fastdyn_offset = off;
+            disas_insn(s, cpu);
+            s->fastdyn_fragment = NULL;
+            if (s->fastdyn_offset != end || s->base.is_jmp != old_jmp ||
+                s->pc_save != saved_pc_save) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "decoder state escaped scalar contract");
+            }
+            off = end;
+        }
+    }
+    s->pc = saved_pc;
+    s->base.pc_next = saved_next;
+    s->pc_save = saved_pc_save;
+}
+
 static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
@@ -3835,6 +4028,9 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 
     switch (sigsetjmp(dc->jmpbuf, 0)) {
     case 0:
+        fastdyn_emit_x86_fragments(dc, cpu);
+        /* Fault restoration for the original instruction sees fragment flags. */
+        tcg_set_insn_start_param(dc->base.insn_start, 1, dc->cc_op);
         disas_insn(dc, cpu);
         break;
     case 1:
@@ -3843,9 +4039,11 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     case 2:
         /* Restore state that may affect the next instruction. */
         dc->pc = dc->base.pc_next;
-        assert(dc->cc_op_dirty == orig_cc_op_dirty);
-        assert(dc->cc_op == orig_cc_op);
-        assert(dc->pc_save == orig_pc_save);
+        /* The rollback also removes fragment IR and its lazy-flag state. */
+        dc->cc_op_dirty = orig_cc_op_dirty;
+        dc->cc_op = orig_cc_op;
+        dc->pc_save = orig_pc_save;
+        dc->fastdyn_fragment = NULL;
         dc->base.num_insns--;
         tcg_remove_ops_after(dc->prev_insn_end);
         dc->base.insn_start = dc->prev_insn_start;

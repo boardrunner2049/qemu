@@ -15,6 +15,8 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "qemu/fastdyn-fragments.h"
+#include "qemu/fastdyn-mmio.h"
 
 /*
  * For best performance, build the plugin with -fvisibility=hidden so that
@@ -255,6 +257,15 @@ void qemu_plugin_vmstate(void);
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_wait_for_budget(void);
 
+QEMU_PLUGIN_API
+bool qemu_plugin_register_fastdyn_fragment(
+    uint64_t guest_pc, const uint8_t *code, size_t code_size,
+    const FastDynCodeSpec *spec, uint64_t *out_hook_id);
+
+QEMU_PLUGIN_API
+bool qemu_plugin_register_fastdyn_mmio_replacement(
+    const FastDynMmioReplacement *replacement, uint64_t *out_hook_id);
+
 /**
  * qemu_plugin_set_budget_exact_stop() - halt exactly on the budget deadline
  * @exact: true to stop the guest precisely on its deadline
@@ -481,7 +492,8 @@ enum qemu_plugin_op {
 	QEMU_PLUGIN_INLINE_UPDATE_MEM,
 	QEMU_PLUGIN_INLINE_LOG_REG,
 	QEMU_PLUGIN_INLINE_LOAD_IO,
-	QEMU_PLUGIN_INLINE_STORE_IO
+	QEMU_PLUGIN_INLINE_STORE_IO,
+	QEMU_PLUGIN_INLINE_CONST_REG
 };
 
 /**
@@ -899,6 +911,37 @@ void qemu_plugin_register_atexit_cb(qemu_plugin_id_t id,
 
 QEMU_PLUGIN_API
 void qemu_plugin_unimp_export_device(void * ops);
+
+enum {
+    QEMU_PLUGIN_UNIMP_ABI_V2 = 2,
+    QEMU_PLUGIN_MMIO_SAVED_PC_VALID = 1u << 0,
+};
+
+typedef struct {
+    /*
+     * The saved PC-register value that the existing FastDyn
+     * register-reading path would return at the beginning of this callback.
+     */
+    uint64_t saved_pc;
+    uint32_t flags;
+} qemu_plugin_mmio_context;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+
+    int (*read)(const char *handler, uint64_t address,
+                uint64_t *value, uint64_t size,
+                const qemu_plugin_mmio_context *context);
+
+    int (*write)(const char *handler, uint64_t address,
+                 uint64_t value, uint64_t size,
+                 const qemu_plugin_mmio_context *context);
+} qemu_plugin_unimp_ops_v2;
+
+QEMU_PLUGIN_API
+bool qemu_plugin_unimp_export_device_v2(
+    const qemu_plugin_unimp_ops_v2 *ops);
 	
 
 /* returns how many vcpus were started at this point */
@@ -1103,5 +1146,9 @@ void qemu_plugin_u64_set(qemu_plugin_u64 entry, unsigned int vcpu_index,
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry);
+
+/* FastDyn private extension level required by the constant-PC overlay. */
+QEMU_PLUGIN_API
+int qemu_plugin_fastdyn_const_pc_chain_version(void);
 
 #endif /* QEMU_QEMU_PLUGIN_H */

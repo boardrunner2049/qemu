@@ -39,6 +39,21 @@ typedef struct RegisterSysregFeatureParam {
    We hack round this by giving the FPA regs zero size when talking to a
    newer gdb.  */
 
+bool arm_cpu_read_saved_pc(CPUState *cs, uint64_t *value)
+{
+    CPUARMState *env = cpu_env(cs);
+
+#ifdef TARGET_AARCH64
+    if (arm_feature(env, ARM_FEATURE_AARCH64)) {
+        *value = env->pc;
+        return true;
+    }
+#endif
+
+    *value = (uint32_t)env->regs[15];
+    return true;
+}
+
 int arm_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 {
     ARMCPU *cpu = ARM_CPU(cs);
@@ -52,6 +67,14 @@ int arm_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 
     if (n < 16) {
         /* Core integer register.  */
+        if (n == 15) {
+            uint64_t pc;
+
+            if (!arm_cpu_read_saved_pc(cs, &pc)) {
+                return 0;
+            }
+            return gdb_get_reg32(mem_buf, pc);
+        }
         return gdb_get_reg32(mem_buf, env->regs[n]);
     }
     if (n == 25) {

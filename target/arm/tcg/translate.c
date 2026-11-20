@@ -28,6 +28,9 @@
 #include "cpregs.h"
 #include "exec/helper-proto.h"
 #include "exec/target_page.h"
+#include "exec/fastdyn-fragments.h"
+#include "exec/fastdyn-mmio.h"
+#include "exec/plugin-gen.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg/sc-capture.h"
@@ -229,6 +232,91 @@ void update_reg(int reg, uint64_t target) {
 	if (reg == 15) {
     	tcg_gen_exit_tb(NULL, 0);
 	}
+#endif
+}
+
+#define FASTDYN_ARM_CONST_PC_THUMB   (1ULL << 8)
+#define FASTDYN_ARM_CONST_PC_SPECIAL (1ULL << 9)
+
+uint64_t fastdyn_const_pc_insn_state(const DisasContextBase *db)
+{
+#ifdef TARGET_AARCH64
+    return 0;
+#else
+    const DisasContext *s = container_of(db, DisasContext, base);
+    uint64_t state = FASTDYN_CONST_PC_SUPPORTED;
+
+    if (tb_cflags(db->tb) & CF_PCREL) {
+        state |= FASTDYN_CONST_PC_NEEDS_PAGE_GUARD;
+    }
+    if (s->thumb) {
+        state |= FASTDYN_ARM_CONST_PC_THUMB;
+    }
+    if (s->condexec_mask || s->condexec_cond || s->eci ||
+        s->ss_active || s->pc_save == -1) {
+        state |= FASTDYN_ARM_CONST_PC_SPECIAL;
+    }
+    return state;
+#endif
+}
+
+bool fastdyn_const_pc_target_is_pc_reg(uint64_t reg)
+{
+#ifdef TARGET_AARCH64
+    return false;
+#else
+    return reg == 15;
+#endif
+}
+
+bool fastdyn_const_pc_target_eligible(uint64_t state, uint64_t source_pc,
+                                     uint64_t destination)
+{
+#ifdef TARGET_AARCH64
+    return false;
+#else
+    if (!(state & FASTDYN_CONST_PC_SUPPORTED) ||
+        (state & FASTDYN_ARM_CONST_PC_SPECIAL) ||
+        destination > UINT32_MAX || destination > 0x20800000 ||
+        source_pc == 0x20800050) {
+        return false;
+    }
+    if (state & FASTDYN_ARM_CONST_PC_THUMB) {
+        return (destination & 1) == 0;
+    }
+    return (destination & 3) == 0;
+#endif
+}
+
+void fastdyn_const_pc_target_emit(uint64_t state, uint64_t destination,
+                                  uint64_t expected_page,
+                                  TCGLabel *fallback)
+{
+#ifndef TARGET_AARCH64
+    if (state & FASTDYN_CONST_PC_NEEDS_PAGE_GUARD) {
+        TCGv_i32 page = tcg_temp_ebb_new_i32();
+
+        g_assert(fallback != NULL);
+        tcg_gen_andi_i32(page, cpu_R[15], TARGET_PAGE_MASK);
+        tcg_gen_brcondi_i32(TCG_COND_NE, page, (uint32_t)expected_page,
+                            fallback);
+        tcg_temp_free_i32(page);
+    }
+    tcg_gen_mov_i32(cpu_R[15], tcg_constant_i32(destination));
+#else
+    g_assert_not_reached();
+#endif
+}
+
+void fastdyn_const_pc_target_emit_legacy(uint64_t destination,
+                                         TCGLabel *fallback)
+{
+#ifndef TARGET_AARCH64
+    g_assert(fallback != NULL);
+    gen_set_label(fallback);
+    update_reg(15, destination);
+#else
+    g_assert_not_reached();
 #endif
 }
 void log_reg(uint8_t * buffer, uint16_t * index, void *consumer_index, int reg);
@@ -1210,10 +1298,178 @@ void gen_aa32_st_internal_i64(DisasContext *s, TCGv_i64 val,
     }
 }
 
+static void fastdyn_mmio_counter_inc(uint64_t *counter)
+{
+    TCGv_ptr ptr;
+    TCGv_i64 value;
+
+    if (!counter) {
+        return;
+    }
+    ptr = tcg_constant_ptr((intptr_t)counter);
+    value = tcg_temp_new_i64();
+    tcg_gen_ld_i64(value, ptr, 0);
+    tcg_gen_addi_i64(value, value, 1);
+    tcg_gen_st_i64(value, ptr, 0);
+}
+
+static void fastdyn_mmio_emit_expr(TCGv_i32 result,
+                                   const FastDynMmioReplacement *r)
+{
+    TCGv_i32 stack[FASTDYN_MMIO_MAX_EXPR_INSNS];
+    TCGv_ptr state = tcg_constant_ptr((intptr_t)r->state);
+    unsigned depth = 0;
+    size_t i;
+
+    for (i = 0; i < r->expr_count; i++) {
+        const FastDynMmioExprInsn *op = &r->expr[i];
+        TCGv_i32 value;
+
+        switch (op->opcode) {
+        case FASTDYN_MMIO_EXPR_CONST:
+            stack[depth++] = tcg_constant_i32(op->value);
+            break;
+        case FASTDYN_MMIO_EXPR_LOAD_U8:
+            value = tcg_temp_new_i32();
+            tcg_gen_ld8u_i32(value, state, op->state_offset);
+            stack[depth++] = value;
+            break;
+        case FASTDYN_MMIO_EXPR_LOAD_U16:
+            value = tcg_temp_new_i32();
+            tcg_gen_ld16u_i32(value, state, op->state_offset);
+            stack[depth++] = value;
+            break;
+        case FASTDYN_MMIO_EXPR_LOAD_U32:
+            value = tcg_temp_new_i32();
+            tcg_gen_ld_i32(value, state, op->state_offset);
+            stack[depth++] = value;
+            break;
+        default: {
+            TCGv_i32 rhs = stack[--depth];
+            TCGv_i32 lhs = stack[--depth];
+            value = tcg_temp_new_i32();
+            switch (op->opcode) {
+            case FASTDYN_MMIO_EXPR_ADD:
+                tcg_gen_add_i32(value, lhs, rhs);
+                break;
+            case FASTDYN_MMIO_EXPR_SUB:
+                tcg_gen_sub_i32(value, lhs, rhs);
+                break;
+            case FASTDYN_MMIO_EXPR_AND:
+                tcg_gen_and_i32(value, lhs, rhs);
+                break;
+            case FASTDYN_MMIO_EXPR_OR:
+                tcg_gen_or_i32(value, lhs, rhs);
+                break;
+            case FASTDYN_MMIO_EXPR_XOR:
+                tcg_gen_xor_i32(value, lhs, rhs);
+                break;
+            case FASTDYN_MMIO_EXPR_SHL:
+                tcg_gen_shl_i32(value, lhs, rhs);
+                break;
+            case FASTDYN_MMIO_EXPR_LSHR:
+                tcg_gen_shr_i32(value, lhs, rhs);
+                break;
+            default:
+                g_assert_not_reached();
+            }
+            stack[depth++] = value;
+            break;
+        }
+        }
+    }
+    tcg_gen_mov_i32(result, stack[0]);
+    if (r->transfer_size == 1) {
+        tcg_gen_andi_i32(result, result, 0xff);
+    } else if (r->transfer_size == 2) {
+        tcg_gen_andi_i32(result, result, 0xffff);
+    }
+}
+
+/* Return true when the original qemu_ld was emitted as the guarded slow arm. */
+static bool fastdyn_mmio_try_load(DisasContext *s, TCGv_i32 val,
+                                 TCGv_i32 a32, int index, MemOp opc)
+{
+    const FastDynMmioBoundReplacement *matches[64];
+    const FastDynMmioBoundReplacement *bound;
+    unsigned transfer_size = 1u << (opc & MO_SIZE);
+    TCGLabel *slow, *done;
+    TCGv_i32 mpu;
+    size_t cursor = 0, count = 0, i;
+
+    if (!s->thumb || !arm_dc_feature(s, ARM_FEATURE_M) ||
+        (opc & (MO_SIGN | MO_BSWAP)) || transfer_size > 4 ||
+        (opc & MO_AMASK) != MO_UNALN) {
+        return false;
+    }
+    while (count < ARRAY_SIZE(matches) &&
+           (bound = fastdyn_mmio_find(s->pc_curr, FASTDYN_CODE_MODE_THUMB,
+                                      transfer_size, &cursor))) {
+        matches[count++] = bound;
+    }
+    if (!count) {
+        return false;
+    }
+
+    slow = gen_new_label();
+    done = gen_new_label();
+
+    /* Never bypass architectural unaligned-access behavior. The original
+     * load below retains its finalized MemOp flags and exception semantics. */
+    if (transfer_size > 1) {
+        TCGv_i32 misaligned = tcg_temp_new_i32();
+        tcg_gen_andi_i32(misaligned, a32, transfer_size - 1);
+        tcg_gen_brcondi_i32(TCG_COND_NE, misaligned, 0, slow);
+    }
+
+    /* An MPU enabled after translation immediately restores protected access. */
+    mpu = tcg_temp_new_i32();
+    tcg_gen_ld_i32(mpu, tcg_env,
+                   offsetof(CPUARMState, v7m.mpu_ctrl[M_REG_NS]));
+    tcg_gen_andi_i32(mpu, mpu, R_V7M_MPU_CTRL_ENABLE_MASK);
+    if (M_REG_NUM_BANKS > 1) {
+        TCGv_i32 secure_mpu = tcg_temp_new_i32();
+        tcg_gen_ld_i32(secure_mpu, tcg_env,
+                       offsetof(CPUARMState, v7m.mpu_ctrl[M_REG_S]));
+        tcg_gen_andi_i32(secure_mpu, secure_mpu,
+                         R_V7M_MPU_CTRL_ENABLE_MASK);
+        tcg_gen_or_i32(mpu, mpu, secure_mpu);
+    }
+    tcg_gen_brcondi_i32(TCG_COND_NE, mpu, 0, slow);
+
+    for (i = 0; i < count; i++) {
+        const FastDynMmioReplacement *r = &matches[i]->replacement;
+        TCGLabel *next = gen_new_label();
+
+        tcg_gen_brcondi_i32(TCG_COND_NE, a32, r->expected_address, next);
+        if (r->disabled) {
+            TCGv_i32 disabled = tcg_temp_new_i32();
+            TCGv_ptr flag = tcg_constant_ptr((intptr_t)r->disabled);
+            tcg_gen_ld_i32(disabled, flag, 0);
+            tcg_gen_brcondi_i32(TCG_COND_NE, disabled, 0, slow);
+        }
+        fastdyn_mmio_emit_expr(val, r);
+        fastdyn_mmio_counter_inc(r->fast_count);
+        tcg_gen_br(done);
+        gen_set_label(next);
+    }
+
+    gen_set_label(slow);
+    gen_aa32_ld_internal_i32(s, val, a32, index, opc);
+    /* MMIO may retry the instruction with can_do_io set. Count completion,
+     * not translation/retry attempts, and never count a fault as a read. */
+    fastdyn_mmio_counter_inc(matches[0]->replacement.fallback_count);
+    gen_set_label(done);
+    return true;
+}
+
 void gen_aa32_ld_i32(DisasContext *s, TCGv_i32 val, TCGv_i32 a32,
                      int index, MemOp opc)
 {
-    gen_aa32_ld_internal_i32(s, val, a32, index, finalize_memop(s, opc));
+    opc = finalize_memop(s, opc);
+    if (!fastdyn_mmio_try_load(s, val, a32, index, opc)) {
+        gen_aa32_ld_internal_i32(s, val, a32, index, opc);
+    }
 }
 
 void gen_aa32_st_i32(DisasContext *s, TCGv_i32 val, TCGv_i32 a32,
@@ -8023,6 +8279,152 @@ static void arm_post_translate_insn(DisasContext *dc)
     }
 }
 
+/* Pure encoding classifiers for the bounded scalar fragment subset. */
+static bool fastdyn_a32_scalar(uint32_t insn)
+{
+    unsigned op;
+
+    if (extract32(insn, 28, 4) != 0xe) {
+        return false;                       /* A32 baseline admits AL only */
+    }
+    if (extract32(insn, 25, 3) == 1 ||
+        (extract32(insn, 25, 3) == 0 && !(insn & (1 << 4)))) {
+        op = extract32(insn, 21, 4);
+        if (!(op == 0 || op == 1 || op == 2 || op == 4 ||
+              op == 8 || op == 9 || op == 10 || op == 11 ||
+              op == 12 || op == 13 || op == 14 || op == 15)) {
+            return false;
+        }
+        if (extract32(insn, 12, 4) == 15 && op < 8) {
+            return false;
+        }
+        if (extract32(insn, 16, 4) == 15 && op != 13 && op != 15) {
+            return false;
+        }
+        return (insn & (1 << 25)) || extract32(insn, 0, 4) != 15;
+    }
+    return (insn & 0x0ff00000) == 0x03000000 || /* MOVW */
+           (insn & 0x0ff00000) == 0x03400000;   /* MOVT */
+}
+
+static bool fastdyn_thumb16_scalar(uint16_t insn)
+{
+    if ((insn & 0xe000) == 0x0000 ||       /* shifts, add/sub */
+        (insn & 0xe000) == 0x2000 ||       /* mov/cmp/add/sub immediate */
+        (insn & 0xfc00) == 0x4000) {       /* register data processing */
+        return true;
+    }
+    if ((insn & 0xfc00) == 0x4400) {       /* high add/cmp/mov, no bx */
+        return extract32(insn, 8, 2) != 3 &&
+               extract32(insn, 3, 4) != 15 &&
+               ((insn & 7) | ((insn >> 4) & 8)) != 15;
+    }
+    return false;
+}
+
+static bool fastdyn_thumb32_scalar(uint32_t insn)
+{
+    uint16_t hi = insn >> 16;
+    unsigned op;
+
+    if ((hi & 0xfe00) == 0xea00) {         /* shifted-register DP */
+        op = extract32(hi, 5, 4);
+        return op == 0 || op == 1 || op == 2 || op == 4 || op == 8 ||
+               op == 10 || op == 11 || op == 12 || op == 13 || op == 14;
+    }
+    if ((hi & 0xf800) == 0xf000 && !(hi & 0x0200)) {
+        op = extract32(hi, 5, 4);          /* modified immediate DP */
+        return op == 0 || op == 2 || op == 4 || op == 8 || op == 13;
+    }
+    return (hi & 0xfb80) == 0xf200 ||      /* ADDW */
+           (hi & 0xfb80) == (0xf2a0 & 0xfb80) || /* SUBW */
+           (hi & 0xff70) == 0xf340 ||      /* SBFX */
+           (hi & 0xff70) == (0xf3c0 & 0xff70);  /* UBFX */
+}
+
+static void fastdyn_emit_arm_fragments(DisasContext *dc, uint32_t pc,
+                                       bool thumb, uint32_t original_insn)
+{
+    FastDynInstructionOrder order = dc->sctlr_b ?
+        FASTDYN_INSN_ORDER_BIG_ENDIAN : FASTDYN_INSN_ORDER_LITTLE_ENDIAN;
+    FastDynCodeMode mode = thumb ? FASTDYN_CODE_MODE_THUMB :
+                                        FASTDYN_CODE_MODE_A32;
+    const FastDynFragment *fragment;
+    size_t cursor = 0, count = 0, bytes = 0;
+    uint32_t saved_insn = dc->insn;
+
+    while ((fragment = fastdyn_fragment_find(pc, FASTDYN_GUEST_ISA_ARM,
+                                              mode, order, &cursor))) {
+        size_t off = 0;
+        if (thumb && (dc->condexec_mask || dc->eci ||
+                      ((original_insn & 0xff00) == 0xbf00 &&
+                       (original_insn & 0xf) != 0))) {
+            fastdyn_fragment_translation_error(fragment, 0,
+                                               "IT instruction or active IT/ECI/ICI state");
+        }
+        while (off < fragment->code_size) {
+            unsigned len = thumb ? 2 : 4;
+            uint32_t word;
+            DisasJumpType old_jmp = dc->base.is_jmp;
+
+            if (thumb) {
+                uint16_t first;
+                if (fragment->code_size - off < 2) {
+                    fastdyn_fragment_translation_error(fragment, off,
+                                                       "truncated Thumb instruction");
+                }
+                first = dc->sctlr_b ? lduw_be_p(fragment->code + off) :
+                                      lduw_le_p(fragment->code + off);
+                len = thumb_insn_is_16bit(dc, pc, first) ? 2 : 4;
+                if (fragment->code_size - off < len) {
+                    fastdyn_fragment_translation_error(fragment, off,
+                                                       "truncated Thumb-2 instruction");
+                }
+                word = len == 2 ? first : ((uint32_t)first << 16) |
+                    (dc->sctlr_b ? lduw_be_p(fragment->code + off + 2) :
+                                   lduw_le_p(fragment->code + off + 2));
+                if (!(len == 2 ? fastdyn_thumb16_scalar(word) :
+                                 fastdyn_thumb32_scalar(word))) {
+                    fastdyn_fragment_translation_error(fragment, off,
+                                                       "not in Thumb scalar subset");
+                }
+            } else {
+                if (fragment->code_size - off < 4) {
+                    fastdyn_fragment_translation_error(fragment, off,
+                                                       "truncated A32 instruction");
+                }
+                word = dc->sctlr_b ? ldl_be_p(fragment->code + off) :
+                                     ldl_le_p(fragment->code + off);
+                if (!fastdyn_a32_scalar(word)) {
+                    fastdyn_fragment_translation_error(fragment, off,
+                                                       "not an AL scalar A32 instruction");
+                }
+            }
+            if (++count > FASTDYN_FRAGMENT_MAX_INSNS ||
+                (bytes += len) > FASTDYN_FRAGMENT_MAX_BYTES) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "combined site limit exceeded");
+            }
+            dc->insn = word;
+            if (thumb) {
+                if (len == 2) {
+                    disas_thumb_insn(dc, word);
+                } else {
+                    disas_thumb2_insn(dc, word);
+                }
+            } else {
+                disas_arm_insn(dc, word);
+            }
+            if (dc->base.is_jmp != old_jmp) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "decoder changed control flow");
+            }
+            off += len;
+        }
+    }
+    dc->insn = saved_insn;
+}
+
 static void arm_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
@@ -8059,6 +8461,7 @@ static void arm_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     insn = arm_ldl_code(env, &dc->base, pc, dc->sctlr_b);
     dc->insn = insn;
     dc->base.pc_next = pc + 4;
+    fastdyn_emit_arm_fragments(dc, pc, false, insn);
     disas_arm_insn(dc, insn);
 
     arm_post_translate_insn(dc);
@@ -8187,6 +8590,8 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         insn_eci_rewind = tcg_last_op();
         insn_eci_pc_save = dc->pc_save;
     }
+
+    fastdyn_emit_arm_fragments(dc, dc->pc_curr, true, insn);
 
     if (dc->condexec_mask && !thumb_insn_is_unconditional(dc, insn)) {
         uint32_t cond = dc->condexec_cond;

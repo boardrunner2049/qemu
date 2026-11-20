@@ -364,6 +364,8 @@ static enum plugin_dyn_cb_type op_to_cb_type(enum qemu_plugin_op op)
         return PLUGIN_CB_INLINE_STORE_U64;
 	case QEMU_PLUGIN_INLINE_UPDATE_REG:
 		return PLUGIN_CB_INLINE_UPDATE_REG;
+	case QEMU_PLUGIN_INLINE_CONST_REG:
+		return PLUGIN_CB_INLINE_CONST_REG;
 	case QEMU_PLUGIN_INLINE_UPDATE_MEM:
 		return PLUGIN_CB_INLINE_UPDATE_MEM;
 	case QEMU_PLUGIN_INLINE_LOG_REG:
@@ -699,8 +701,14 @@ void qemu_plugin_atexit_cb(void)
 
 
 extern void unimp_export_device(void * arg);
+extern bool unimp_export_device_v2(const qemu_plugin_unimp_ops_v2 *ops);
 void qemu_plugin_unimp_export_device(void * ops) {
 		unimp_export_device(ops);
+}
+
+bool qemu_plugin_unimp_export_device_v2(const qemu_plugin_unimp_ops_v2 *ops)
+{
+    return unimp_export_device_v2(ops);
 }
 
 void qemu_plugin_register_atexit_cb(qemu_plugin_id_t id,

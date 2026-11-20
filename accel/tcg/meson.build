@@ -4,6 +4,9 @@ endif
 
 tcg_ss = ss.source_set()
 
+tcg_ss.add(files('fastdyn-fragments.c'))
+tcg_ss.add(files('fastdyn-mmio.c'))
+
 tcg_ss.add(files(
   'cpu-exec.c',
   'cpu-exec-common.c',

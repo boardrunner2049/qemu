@@ -18,6 +18,7 @@
  */
 #include "qemu/osdep.h"
 #include "exec/target_page.h"
+#include "exec/fastdyn-fragments.h"
 #include "translate.h"
 #include "translate-a64.h"
 #include "qemu/log.h"
@@ -10209,6 +10210,57 @@ static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     dc->insn_start_updated = false;
 }
 
+static bool fastdyn_a64_scalar(uint32_t insn)
+{
+    uint32_t group = insn & 0x1f800000;
+
+    if (group == 0x11000000 ||            /* add/sub immediate */
+        group == 0x12000000 ||            /* logical immediate */
+        group == 0x12800000 ||            /* move wide */
+        group == 0x13000000) {            /* bitfield shifts/extensions */
+        return true;
+    }
+    return (insn & 0x1f000000) == 0x0a000000 || /* logical shifted */
+           (insn & 0x1f000000) == 0x0b000000;   /* add/sub reg */
+}
+
+static void fastdyn_emit_a64_fragments(DisasContext *s, uint64_t pc)
+{
+    const FastDynFragment *fragment;
+    size_t cursor = 0, count = 0, bytes = 0;
+    uint32_t saved_insn = s->insn;
+
+    while ((fragment = fastdyn_fragment_find(pc, FASTDYN_GUEST_ISA_AARCH64,
+                    FASTDYN_CODE_MODE_A64, FASTDYN_INSN_ORDER_LITTLE_ENDIAN,
+                    &cursor))) {
+        size_t off;
+        for (off = 0; off < fragment->code_size; off += 4) {
+            uint32_t word;
+            DisasJumpType old_jmp = s->base.is_jmp;
+            if (fragment->code_size - off < 4) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "truncated A64 instruction");
+            }
+            word = ldl_le_p(fragment->code + off);
+            if (!fastdyn_a64_scalar(word)) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "not in A64 scalar subset");
+            }
+            if (++count > FASTDYN_FRAGMENT_MAX_INSNS ||
+                (bytes += 4) > FASTDYN_FRAGMENT_MAX_BYTES) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "combined site limit exceeded");
+            }
+            s->insn = word;
+            if (!disas_a64(s, word) || s->base.is_jmp != old_jmp) {
+                fastdyn_fragment_translation_error(fragment, off,
+                                                   "unavailable or control-changing instruction");
+            }
+        }
+    }
+    s->insn = saved_insn;
+}
+
 static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *s = container_of(dcbase, DisasContext, base);
@@ -10289,6 +10341,8 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
             tcg_debug_assert(s->btype == 0);
         }
     }
+
+    fastdyn_emit_a64_fragments(s, pc);
 
     s->is_nonstreaming = false;
     if (s->sme_trap_nonstreaming) {
