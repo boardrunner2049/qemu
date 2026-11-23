@@ -889,6 +889,7 @@ static struct {
     uint32_t *source_region;
     GHashTable *trusted_tbs;
     bool experiment_source_index;
+    bool experiment_linear_source_scan;
     bool experiment_trusted_set;
     bool experiment_no_tree;
     bool experiment_incoming_chain;
@@ -1217,7 +1218,15 @@ static void sc7_load_ext(void)
             sc7_die("edge %u field is outside source code", i);
         }
     }
-    if (trusted && sc7.experiment_source_index) {
+    /*
+     * Region entry is a runtime lookup, not a validation path.  The original
+     * implementation nested the region scan with sc7_source_index(), which
+     * itself scans every public cache record.  Build the first-match map once
+     * for trusted artifacts; linear-source-scan exists only to reproduce the
+     * old behavior in a causal benchmark.
+     */
+    if (trusted && !sc7.experiment_linear_source_scan) {
+        sc7.experiment_source_index = true;
         sc7.source_region = g_new(uint32_t, supercache.entry_count + 1);
         for (uint32_t i = 0; i <= supercache.entry_count; i++) {
             sc7.source_region[i] = UINT32_MAX;
@@ -1360,10 +1369,12 @@ static void sc7_write_stats(void)
     g_string_append_printf(j, "  \"mode\": \"%s\",\n",
                            sc7.trusted ? "trusted" : "safe");
     g_string_append_printf(j,
-        "  \"experiment\": {\"source_index\": %s, \"trusted_set\": %s, "
+        "  \"experiment\": {\"source_index\": %s, "
+        "\"linear_source_scan\": %s, \"trusted_set\": %s, "
         "\"no_tree\": %s, \"incoming_chain\": %s, "
         "\"disable_chaining\": %s, \"no_regions\": %s},\n",
         sc7.experiment_source_index ? "true" : "false",
+        sc7.experiment_linear_source_scan ? "true" : "false",
         sc7.experiment_trusted_set ? "true" : "false",
         sc7.experiment_no_tree ? "true" : "false",
         sc7.experiment_incoming_chain ? "true" : "false",
@@ -1463,6 +1474,8 @@ static void sc7_configure_from_env(void)
         for (char **token = tokens; *token; token++) {
             if (!strcmp(*token, "source-index")) {
                 sc7.experiment_source_index = true;
+            } else if (!strcmp(*token, "linear-source-scan")) {
+                sc7.experiment_linear_source_scan = true;
             } else if (!strcmp(*token, "trusted-set")) {
                 sc7.experiment_trusted_set = true;
             } else if (!strcmp(*token, "no-tree")) {
