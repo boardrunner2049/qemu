@@ -900,14 +900,16 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
  * the QHT or guest-page TB lists.  Retire those bindings without taking the
  * ordinary qht_remove() early return in do_tb_phys_invalidate().  The caller
  * removes non-private outgoing jumps before calling this helper. */
-void tb_supercache_invalidate_private(TranslationBlock *tb)
+void tb_supercache_invalidate_private(TranslationBlock *tb, bool registered)
 {
     qemu_spin_lock(&tb->jmp_lock);
     qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
     qemu_spin_unlock(&tb->jmp_lock);
     tb_jmp_cache_inval_tb(tb);
     tb_jmp_unlink(tb);
-    tcg_tb_remove(tb);
+    if (registered) {
+        tcg_tb_remove(tb);
+    }
 }
 
 /* A private TB is deliberately absent from PageDesc.first_tb.  Still create

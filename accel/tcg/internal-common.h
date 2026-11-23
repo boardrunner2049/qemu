@@ -52,7 +52,7 @@ void page_init(void);
 void tb_htable_init(void);
 void tb_reset_jump(TranslationBlock *tb, int n);
 void tb_unlink_jump(TranslationBlock *tb, int n);
-void tb_supercache_invalidate_private(TranslationBlock *tb);
+void tb_supercache_invalidate_private(TranslationBlock *tb, bool registered);
 void tb_supercache_protect_code(tb_page_addr_t addr);
 TranslationBlock *tb_link_page(TranslationBlock *tb);
 TranslationBlock *tb_supercache_link(TranslationBlock *tb);

@@ -804,6 +804,8 @@ static struct {
 #define SC7_DIR_OFFSET            0x100
 #define SC7_DIR_MAGIC             "QSC7FWRG"
 #define SC7_FEAT_FIRMWARE_REGIONS 1u
+#define SC7_DIR_VERSION_COMPOSITE 2u
+#define SC7_REGION_COMPOSITE      1u
 
 typedef struct Sc7DirHeader {
     char magic[8];
@@ -872,18 +874,24 @@ static struct {
     Sc7RegionEntry *regions;
     Sc7MemberEntry *members;
     Sc7EdgeEntry *edges;
+    bool *region_admitted;
+    bool *member_prepared;
     TranslationBlock **private_tbs;
     uint32_t *source_index;
     uint64_t entries;
+    uint64_t region_activations;
+    uint64_t member_descriptors_instantiated;
     uint64_t members_activated;
     uint64_t dependency_refusals;
     uint64_t dependency_invalidations;
+    uint64_t mapping_invalidations;
     uint64_t internal_edges;
     uint64_t search_hits;
     char *stats_path;
 } sc7;
 
 static void sc7_runtime_reset(void);
+static void sc7_mapping_changed(CPUState *cpu);
 static G_NORETURN G_GNUC_PRINTF(1, 2) void sc7_die(const char *fmt, ...);
 
 typedef struct Sc7Span {
@@ -965,7 +973,8 @@ static void sc7_load_ext(void)
     if (pread(supercache.fd, &h, sizeof(h), SC7_DIR_OFFSET) != sizeof(h)) {
         sc7_die("cannot read directory header");
     }
-    if (memcmp(h.magic, SC7_DIR_MAGIC, 8) || h.ext_version != 1 ||
+    if (memcmp(h.magic, SC7_DIR_MAGIC, 8) ||
+        h.ext_version != SC7_DIR_VERSION_COMPOSITE ||
         h.header_size != sizeof(h) || h.region_entry_size != sizeof(Sc7RegionEntry) ||
         memcmp(h.reserved, zero, sizeof(zero))) {
         sc7_die("bad directory header");
@@ -995,6 +1004,8 @@ static void sc7_load_ext(void)
     sc7.edges = g_memdup2(table + h.n_regions * sizeof(Sc7RegionEntry) +
                           h.n_members * sizeof(Sc7MemberEntry),
                           h.n_edges * sizeof(Sc7EdgeEntry));
+    sc7.region_admitted = g_new0(bool, h.n_regions + 1);
+    sc7.member_prepared = g_new0(bool, h.n_members + 1);
     sc7.private_tbs = g_new0(TranslationBlock *, h.n_members + 1);
     sc7.source_index = g_new(uint32_t, h.n_members + 1);
     region_spans = g_new(Sc7Span, (uint64_t)h.n_regions + 1);
@@ -1003,10 +1014,11 @@ static void sc7_load_ext(void)
         uint64_t member_end = (uint64_t)r->first_member + r->n_members;
         uint64_t edge_end = (uint64_t)r->first_edge + r->n_edges;
 
-        if (r->flags || r->first_member != expected_member ||
+        if (r->flags != SC7_REGION_COMPOSITE || r->entry_member != 0 ||
+            r->first_member != expected_member ||
             r->first_edge != expected_edge || !r->n_members ||
             member_end > h.n_members || edge_end > h.n_edges ||
-            r->entry_member >= r->n_members || r->start_offset % 64 ||
+            r->start_offset % 64 ||
             sc7_source_index(r->source_tb_offset) == UINT32_MAX ||
             r->end_offset > h.table_offset || r->start_offset >= r->end_offset) {
             sc7_die("region %u has invalid slices", i);
@@ -1071,9 +1083,45 @@ static void sc7_load_ext(void)
     for (uint32_t i = 0; i < h.n_regions; i++) {
         Sc7RegionEntry *r = &sc7.regions[i];
         uint32_t entry = r->first_member + r->entry_member;
+        uint64_t descriptor_next = r->start_offset;
+        uint64_t code_next;
+        uint64_t search_next;
 
         if (sc7.members[entry].source_tb_offset != r->source_tb_offset) {
             sc7_die("region %u entry source record mismatch", i);
+        }
+        for (uint32_t n = 0; n < r->n_members; n++) {
+            Sc7MemberEntry *m = &sc7.members[r->first_member + n];
+
+            if (m->tb_offset != descriptor_next) {
+                sc7_die("region %u member descriptors are not contiguous", i);
+            }
+            descriptor_next += supercache.header.tb_size;
+        }
+        code_next = ROUND_UP(descriptor_next, 16);
+        for (uint32_t n = 0; n < r->n_members; n++) {
+            Sc7MemberEntry *m = &sc7.members[r->first_member + n];
+
+            if (m->tc_offset != code_next) {
+                sc7_die("region %u member code is not contiguous", i);
+            }
+            code_next += m->tc_size;
+        }
+        search_next = code_next;
+        for (uint32_t n = 0; n < r->n_members; n++) {
+            uint32_t mi = r->first_member + n;
+            Sc7MemberEntry *m = &sc7.members[mi];
+            SupercacheRecord *s =
+                &supercache.entries[sc7.source_index[mi]].record;
+            uint64_t search_size = s->end_offset - s->tc_offset - s->tc_size;
+
+            if (m->search_offset != search_next) {
+                sc7_die("region %u member search data is not contiguous", i);
+            }
+            search_next += search_size;
+        }
+        if (search_next != r->end_offset) {
+            sc7_die("region %u end does not match composite payload", i);
         }
     }
     for (uint32_t i = 0; i < h.n_edges; i++) {
@@ -1109,7 +1157,7 @@ static void sc7_verify_hashes(void)
 {
     uint8_t *buf = supercache.buffer;
     GChecksum *artifact = g_checksum_new(G_CHECKSUM_SHA256);
-    static const uint8_t domain[] = "scopt.sc7/1";
+    static const uint8_t domain[] = "scopt.sc7/2";
     uint8_t artifact_digest[32];
     gsize artifact_len = sizeof(artifact_digest);
     uint8_t zero_id[8] = { 0 };
@@ -1199,16 +1247,24 @@ static void sc7_write_stats(void)
         "  \"regions_loaded\": %" PRIu32 ",\n"
         "  \"members_loaded\": %" PRIu32 ",\n"
         "  \"region_entries\": %" PRIu64 ",\n"
+        "  \"region_activations\": %" PRIu64 ",\n"
+        "  \"member_descriptors_instantiated\": %" PRIu64 ",\n"
+        "  \"members_registered\": %" PRIu64 ",\n"
         "  \"members_activated\": %" PRIu64 ",\n"
         "  \"internal_edges_admitted\": %" PRIu64 ",\n"
         "  \"dependency_refusals\": %" PRIu64 ",\n"
         "  \"dependency_invalidations\": %" PRIu64 ",\n"
+        "  \"mapping_invalidations\": %" PRIu64 ",\n"
         "  \"search_data_hits\": %" PRIu64 "\n}\n",
         sc7.loaded ? sc7.header.n_regions : 0,
         sc7.loaded ? sc7.header.n_members : 0,
-        sc7.entries, sc7.members_activated, sc7.internal_edges,
+        sc7.entries, sc7.region_activations,
+        sc7.member_descriptors_instantiated, sc7.members_activated,
+        sc7.members_activated,
+        sc7.internal_edges,
         sc7.dependency_refusals,
-        sc7.dependency_invalidations, sc7.search_hits);
+        sc7.dependency_invalidations, sc7.mapping_invalidations,
+        sc7.search_hits);
     if (!g_file_set_contents(sc7.stats_path, j->str, j->len, NULL)) {
         warn_report("supercache: cannot write QEMU_SC_V7_STATS file '%s'",
                     sc7.stats_path);
@@ -1916,6 +1972,9 @@ void tcg_supercache_mapping_changed(CPUState *cpu)
 {
     uint32_t cleared;
 
+    if (unlikely(sc7.loaded)) {
+        sc7_mapping_changed(cpu);
+    }
     if (likely(!sc6.loaded)) {
         return;
     }
@@ -2285,12 +2344,29 @@ static bool sc7_member_internal_slot(uint32_t member, uint16_t field)
     return false;
 }
 
-static TranslationBlock *sc7_build_member(CPUState *cpu, uint32_t index)
+static TranslationBlock *sc7_member_tb(uint32_t index)
+{
+    return (TranslationBlock *)((uint8_t *)supercache.buffer +
+                                sc7.members[index].tb_offset);
+}
+
+/*
+ * A composite region has one registered entry TB and one shadow descriptor
+ * for each member.  Native exits embedded in copied member code still carry
+ * that member's descriptor address, and unwind/icount/plugin recovery needs
+ * its original metadata.  Consequently all descriptors must be initialized
+ * before the entry can run, but only the entry is inserted in the host-PC
+ * tree.  Host-PC recovery finds shadows directly by their member code range.
+ */
+static TranslationBlock *sc7_prepare_member(CPUState *cpu, uint32_t index)
 {
     Sc7MemberEntry *m = &sc7.members[index];
     SupercacheRecord *r = &supercache.entries[sc7.source_index[index]].record;
-    TranslationBlock *tb = (TranslationBlock *)
-        ((uint8_t *)supercache.buffer + m->tb_offset);
+    TranslationBlock *tb = sc7_member_tb(index);
+
+    if (sc7.member_prepared[index]) {
+        return tb;
+    }
 
     memset(tb, 0, sizeof(*tb));
     tb->pc = r->pc;
@@ -2320,18 +2396,29 @@ static TranslationBlock *sc7_build_member(CPUState *cpu, uint32_t index)
         }
     }
     qemu_thread_jit_execute();
+    /* The plugin path obtains member-local search data through this flag. */
+    sc7.member_prepared[index] = true;
     qemu_plugin_supercache_rehydrate(cpu, tb, m->guest_vaddr, false);
-    flush_idcache_range((uintptr_t)tb->tc.ptr, (uintptr_t)tb->tc.ptr,
-                        tb->tc.size);
-    tcg_tb_insert(tb);
-    sc7.private_tbs[index] = tb;
-    sc7.members_activated++;
+    sc7.member_descriptors_instantiated++;
+    return tb;
+}
+
+static TranslationBlock *sc7_register_entry(uint32_t index)
+{
+    TranslationBlock *tb = sc7_member_tb(index);
+
+    g_assert(sc7.member_prepared[index]);
+    if (!sc7.private_tbs[index]) {
+        tcg_tb_insert(tb);
+        sc7.private_tbs[index] = tb;
+        sc7.members_activated++;
+    }
     return tb;
 }
 
 static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
 {
-    if (!sc7.loaded || cpu->singlestep_enabled ||
+    if (!sc7.loaded || scp_active || cpu->singlestep_enabled ||
         !QTAILQ_EMPTY(&cpu->breakpoints) || !QTAILQ_EMPTY(&cpu->watchpoints)) {
         return NULL;
     }
@@ -2341,36 +2428,119 @@ static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
         if (sc7_source_index(region->source_tb_offset) != source) {
             continue;
         }
-        for (uint32_t n = 0; n < region->n_members; n++) {
-            uint32_t mi = region->first_member + n;
-            SupercacheEntry *dep = &supercache.entries[sc7.source_index[mi]];
-            SupercacheRecord *r = &dep->record;
+        if (!sc7.region_admitted[ri]) {
+            for (uint32_t n = 0; n < region->n_members; n++) {
+                uint32_t mi = region->first_member + n;
+                SupercacheEntry *dep =
+                    &supercache.entries[sc7.source_index[mi]];
+                SupercacheRecord *r = &dep->record;
 
-            if (dep->invalid || guest_hash(r->page_addr0, r->page_addr1,
-                                           r->guest_size) != r->guest_hash) {
-                sc7.dependency_refusals++;
-                return NULL;
+                if (dep->invalid || guest_hash(r->page_addr0, r->page_addr1,
+                                               r->guest_size) != r->guest_hash) {
+                    sc7.dependency_refusals++;
+                    return NULL;
+                }
             }
+            sc7.region_admitted[ri] = true;
         }
         for (uint32_t n = 0; n < region->n_members; n++) {
             uint32_t mi = region->first_member + n;
 
-            if (!sc7.private_tbs[mi]) {
-                sc7_build_member(cpu, mi);
-            }
+            sc7_prepare_member(cpu, mi);
+        }
+        uint32_t entry = region->first_member + region->entry_member;
+
+        if (!sc7.private_tbs[entry]) {
+            Sc7MemberEntry *first = &sc7.members[region->first_member];
+            Sc7MemberEntry *last =
+                &sc7.members[region->first_member + region->n_members - 1];
+            TranslationBlock *entry_tb = sc7_member_tb(entry);
+            uint64_t code_end = last->tc_offset + last->tc_size;
+
+            entry_tb->tc.ptr = (uint8_t *)supercache.buffer + first->tc_offset;
+            entry_tb->tc.size = code_end - first->tc_offset;
+            flush_idcache_range((uintptr_t)entry_tb->tc.ptr,
+                                (uintptr_t)entry_tb->tc.ptr,
+                                entry_tb->tc.size);
+            sc7_register_entry(entry);
+            sc7.region_activations++;
         }
         sc7.entries++;
         sc7.internal_edges += region->n_edges;
-        return sc7.private_tbs[region->first_member + region->entry_member];
+        return sc7.private_tbs[entry];
     }
     return NULL;
+}
+
+static bool sc7_any_live(void)
+{
+    for (uint32_t i = 0; i < sc7.header.n_members; i++) {
+        if (sc7.member_prepared[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sc7_retire_all(void)
+{
+    qemu_thread_jit_write();
+    for (uint32_t i = 0; i < sc7.header.n_members; i++) {
+        TranslationBlock *tb;
+        bool registered;
+
+        if (!sc7.member_prepared[i]) {
+            continue;
+        }
+        tb = sc7_member_tb(i);
+        registered = sc7.private_tbs[i] != NULL;
+        for (int slot = 0; slot < 2; slot++) {
+            if (tb->jmp_reset_offset[slot] != TB_JMP_OFFSET_INVALID &&
+                !sc7_member_internal_slot(i, tb->jmp_insn_offset[slot])) {
+                tb_unlink_jump(tb, slot);
+            }
+        }
+        tb_supercache_invalidate_private(tb, registered);
+        sc7.private_tbs[i] = NULL;
+        sc7.member_prepared[i] = false;
+    }
+    qemu_thread_jit_execute();
+}
+
+static void sc7_disarm_mapping_work(CPUState *cpu, run_on_cpu_data data)
+{
+    g_assert(cpu_in_exclusive_context(cpu));
+    if (sc7.loaded && sc7_any_live()) {
+        sc7_retire_all();
+        sc7.mapping_invalidations++;
+    }
+}
+
+static void sc7_mapping_changed(CPUState *cpu)
+{
+    memset(sc7.region_admitted, 0,
+           sizeof(*sc7.region_admitted) * (sc7.header.n_regions + 1));
+    if (sc7_any_live()) {
+        /*
+         * Every member retains its ordinary exit-request check.  Requesting
+         * an exit prevents a changed mapping from crossing the next direct
+         * internal edge; exclusive work retires all descriptors before the
+         * CPU resumes ordinary dispatch.
+         */
+        cpu_exit(cpu);
+        async_safe_run_on_cpu(cpu, sc7_disarm_mapping_work,
+                              RUN_ON_CPU_NULL);
+    }
 }
 
 static void sc7_runtime_reset(void)
 {
     if (sc7.loaded) {
-        memset(sc7.private_tbs, 0,
-               sizeof(*sc7.private_tbs) * (sc7.header.n_members + 1));
+        if (sc7_any_live()) {
+            sc7_retire_all();
+        }
+        memset(sc7.region_admitted, 0,
+               sizeof(*sc7.region_admitted) * (sc7.header.n_regions + 1));
     }
 }
 
@@ -2380,7 +2550,12 @@ const uint8_t *tcg_supercache_search_data(const TranslationBlock *tb)
         return NULL;
     }
     for (uint32_t i = 0; i < sc7.header.n_members; i++) {
-        if (sc7.private_tbs[i] == tb) {
+        /*
+         * Precise SMC recovery retires a region before unwinding the store
+         * that invalidated it.  Descriptor identity and immutable search
+         * bytes remain valid after member_prepared is cleared.
+         */
+        if (sc7_member_tb(i) == tb) {
             sc7.search_hits++;
             return (const uint8_t *)supercache.buffer +
                    sc7.members[i].search_offset;
@@ -2433,13 +2608,17 @@ bool tcg_supercache_code_invalidated(tb_page_addr_t start,
         if (!affected) {
             continue;
         }
+        sc7.region_admitted[ri] = false;
         for (uint32_t n = 0; n < region->n_members; n++) {
             uint32_t mi = region->first_member + n;
-            TranslationBlock *tb = sc7.private_tbs[mi];
+            TranslationBlock *tb;
+            bool registered;
 
-            if (!tb) {
+            if (!sc7.member_prepared[mi]) {
                 continue;
             }
+            tb = sc7_member_tb(mi);
+            registered = sc7.private_tbs[mi] != NULL;
             current_affected |= tb == current_tb;
             for (int slot = 0; slot < 2; slot++) {
                 if (tb->jmp_reset_offset[slot] != TB_JMP_OFFSET_INVALID &&
@@ -2448,8 +2627,9 @@ bool tcg_supercache_code_invalidated(tb_page_addr_t start,
                     tb_unlink_jump(tb, slot);
                 }
             }
-            tb_supercache_invalidate_private(tb);
+            tb_supercache_invalidate_private(tb, registered);
             sc7.private_tbs[mi] = NULL;
+            sc7.member_prepared[mi] = false;
         }
         sc7.dependency_invalidations++;
     }
@@ -2905,12 +3085,25 @@ TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr)
     SupercacheEntry *entry;
     SupercacheRecord *record;
 
-    if (!supercache.initialized || !supercache.flat ||
+    if (!supercache.initialized ||
         tc_ptr < (uintptr_t)supercache.buffer ||
         tc_ptr - (uintptr_t)supercache.buffer >= supercache.size) {
         return NULL;
     }
     offset = tc_ptr - (uintptr_t)supercache.buffer;
+    if (sc7.loaded) {
+        for (uint32_t i = 0; i < sc7.header.n_members; i++) {
+            Sc7MemberEntry *m = &sc7.members[i];
+
+            if (sc7.member_prepared[i] && offset >= m->tc_offset &&
+                offset < m->tc_offset + m->tc_size) {
+                return sc7_member_tb(i);
+            }
+        }
+    }
+    if (!supercache.flat) {
+        return NULL;
+    }
     while (low < high) {
         uint32_t mid = low + (high - low) / 2;
 
