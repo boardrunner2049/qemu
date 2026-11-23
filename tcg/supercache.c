@@ -1253,21 +1253,19 @@ static void sc7_load_ext(void)
             sc7_die("edge %u field is outside source code", i);
         }
     }
-    /*
-     * Region entry is a runtime lookup, not a validation path.  The original
-     * implementation nested the region scan with sc7_source_index(), which
-     * itself scans every public cache record.  Build the first-match map once
-     * for trusted artifacts; linear-source-scan exists only to reproduce the
-     * old behavior in a causal benchmark.
-     */
-    if (trusted && !sc7.experiment_linear_source_scan) {
+    /* Index immutable record identities. Safe regions still check all live
+     * dependencies on admission and clear admission on invalidation. Keep
+     * the first directory match, just as the linear lookup does. */
+    if (!sc7.experiment_linear_source_scan) {
         sc7.experiment_source_index = true;
         sc7.source_region = g_new(uint32_t, supercache.entry_count + 1);
         for (uint32_t i = 0; i <= supercache.entry_count; i++) {
             sc7.source_region[i] = UINT32_MAX;
         }
         for (uint32_t ri = 0; ri < h.n_regions; ri++) {
-            uint32_t source = sc7_source_index(sc7.regions[ri].source_tb_offset);
+            const Sc7RegionEntry *region = &sc7.regions[ri];
+            uint32_t source =
+                sc7.source_index[region->first_member + region->entry_member];
 
             if (sc7.source_region[source] == UINT32_MAX) {
                 sc7.source_region[source] = ri;
@@ -2819,7 +2817,7 @@ static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
     if (sc7.experiment_no_regions) {
         return NULL;
     }
-    if (sc7.trusted && sc7.source_region) {
+    if (sc7.source_region) {
         uint32_t region = source < supercache.entry_count ?
                           sc7.source_region[source] : UINT32_MAX;
 
