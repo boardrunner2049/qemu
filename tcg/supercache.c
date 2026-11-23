@@ -887,6 +887,9 @@ static struct {
     uint64_t mapping_invalidations;
     uint64_t internal_edges;
     uint64_t search_hits;
+    uint64_t member_callback_replays;
+    uint64_t member_callback_omissions;
+    uint64_t member_callbacks_executed;
     char *stats_path;
 } sc7;
 
@@ -1255,6 +1258,9 @@ static void sc7_write_stats(void)
         "  \"dependency_refusals\": %" PRIu64 ",\n"
         "  \"dependency_invalidations\": %" PRIu64 ",\n"
         "  \"mapping_invalidations\": %" PRIu64 ",\n"
+        "  \"member_callback_replays\": %" PRIu64 ",\n"
+        "  \"member_callback_omissions\": %" PRIu64 ",\n"
+        "  \"member_callbacks_executed\": %" PRIu64 ",\n"
         "  \"search_data_hits\": %" PRIu64 "\n}\n",
         sc7.loaded ? sc7.header.n_regions : 0,
         sc7.loaded ? sc7.header.n_members : 0,
@@ -1264,6 +1270,8 @@ static void sc7_write_stats(void)
         sc7.internal_edges,
         sc7.dependency_refusals,
         sc7.dependency_invalidations, sc7.mapping_invalidations,
+        sc7.member_callback_replays, sc7.member_callback_omissions,
+        sc7.member_callbacks_executed,
         sc7.search_hits);
     if (!g_file_set_contents(sc7.stats_path, j->str, j->len, NULL)) {
         warn_report("supercache: cannot write QEMU_SC_V7_STATS file '%s'",
@@ -2398,7 +2406,17 @@ static TranslationBlock *sc7_prepare_member(CPUState *cpu, uint32_t index)
     qemu_thread_jit_execute();
     /* The plugin path obtains member-local search data through this flag. */
     sc7.member_prepared[index] = true;
-    qemu_plugin_supercache_rehydrate(cpu, tb, m->guest_vaddr, false);
+    bool omit = !cpu->singlestep_enabled &&
+                QTAILQ_EMPTY(&cpu->breakpoints) &&
+                QTAILQ_EMPTY(&cpu->watchpoints) &&
+                qemu_plugin_tb_restore_omittable(cpu, m->guest_vaddr,
+                                                 r->guest_size);
+    unsigned callbacks = qemu_plugin_supercache_rehydrate(
+        cpu, tb, m->guest_vaddr, omit);
+
+    sc7.member_callback_omissions += omit;
+    sc7.member_callback_replays += !omit;
+    sc7.member_callbacks_executed += callbacks;
     sc7.member_descriptors_instantiated++;
     return tb;
 }
