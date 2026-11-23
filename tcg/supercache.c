@@ -757,6 +757,7 @@ static const char *const sc6_forbid_names[] = {
 
 /* Set once QEMU_SC_V6_STATS was accepted; read by cpu-exec/translate-all. */
 bool tcg_sc6_stats_active;
+bool tcg_sc7_stats_active;
 
 static struct {
     bool loaded;
@@ -885,6 +886,15 @@ static struct {
     bool *member_prepared;
     TranslationBlock **private_tbs;
     uint32_t *source_index;
+    uint32_t *source_region;
+    GHashTable *trusted_tbs;
+    bool experiment_source_index;
+    bool experiment_trusted_set;
+    bool experiment_no_tree;
+    bool experiment_incoming_chain;
+    bool experiment_disable_chaining;
+    bool experiment_no_regions;
+    bool benchmark_window;
     uint64_t entries;
     uint64_t region_activations;
     uint64_t member_descriptors_instantiated;
@@ -906,6 +916,21 @@ static struct {
     uint64_t trusted_callbacks_executed;
     uint64_t artifact_hash_validations;
     uint64_t trusted_artifact_hash_validations;
+    uint64_t try_region_calls;
+    uint64_t region_comparisons;
+    uint64_t trusted_tb_calls;
+    uint64_t trusted_tb_comparisons;
+    uint64_t trusted_tree_insertions;
+    uint64_t chain_attempts;
+    uint64_t chain_allowed;
+    uint64_t chain_installs;
+    uint64_t chain_installs_trusted_destination;
+    uint64_t chain_skipped_global;
+    uint64_t chain_skipped_trusted_source;
+    uint64_t chain_skipped_trusted_destination;
+    uint64_t benchmark_region_entries;
+    uint64_t benchmark_region_activations;
+    uint64_t benchmark_tree_insertions;
     char *stats_path;
 } sc7;
 
@@ -1192,6 +1217,22 @@ static void sc7_load_ext(void)
             sc7_die("edge %u field is outside source code", i);
         }
     }
+    if (trusted && sc7.experiment_source_index) {
+        sc7.source_region = g_new(uint32_t, supercache.entry_count + 1);
+        for (uint32_t i = 0; i <= supercache.entry_count; i++) {
+            sc7.source_region[i] = UINT32_MAX;
+        }
+        for (uint32_t ri = 0; ri < h.n_regions; ri++) {
+            uint32_t source = sc7_source_index(sc7.regions[ri].source_tb_offset);
+
+            if (sc7.source_region[source] == UINT32_MAX) {
+                sc7.source_region[source] = ri;
+            }
+        }
+    }
+    if (trusted && sc7.experiment_trusted_set) {
+        sc7.trusted_tbs = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
     sc7.header = h;
     sc7.trusted = trusted;
     sc7.loaded = true;
@@ -1318,6 +1359,16 @@ static void sc7_write_stats(void)
                            sc7.loaded ? "true" : "false");
     g_string_append_printf(j, "  \"mode\": \"%s\",\n",
                            sc7.trusted ? "trusted" : "safe");
+    g_string_append_printf(j,
+        "  \"experiment\": {\"source_index\": %s, \"trusted_set\": %s, "
+        "\"no_tree\": %s, \"incoming_chain\": %s, "
+        "\"disable_chaining\": %s, \"no_regions\": %s},\n",
+        sc7.experiment_source_index ? "true" : "false",
+        sc7.experiment_trusted_set ? "true" : "false",
+        sc7.experiment_no_tree ? "true" : "false",
+        sc7.experiment_incoming_chain ? "true" : "false",
+        sc7.experiment_disable_chaining ? "true" : "false",
+        sc7.experiment_no_regions ? "true" : "false");
     g_string_append_printf(j, "  \"file_version\": %" PRIu32 ",\n",
                            supercache.loaded_header.version);
     g_string_append(j, "  \"artifact_id8\": \"");
@@ -1349,6 +1400,21 @@ static void sc7_write_stats(void)
         "  \"trusted_callbacks_executed\": %" PRIu64 ",\n"
         "  \"artifact_hash_validations\": %" PRIu64 ",\n"
         "  \"trusted_artifact_hash_validations\": %" PRIu64 ",\n"
+        "  \"try_region_calls\": %" PRIu64 ",\n"
+        "  \"region_comparisons\": %" PRIu64 ",\n"
+        "  \"trusted_tb_calls\": %" PRIu64 ",\n"
+        "  \"trusted_tb_comparisons\": %" PRIu64 ",\n"
+        "  \"trusted_tree_insertions\": %" PRIu64 ",\n"
+        "  \"chain_attempts\": %" PRIu64 ",\n"
+        "  \"chain_allowed\": %" PRIu64 ",\n"
+        "  \"chain_installs\": %" PRIu64 ",\n"
+        "  \"chain_installs_trusted_destination\": %" PRIu64 ",\n"
+        "  \"chain_skipped_global\": %" PRIu64 ",\n"
+        "  \"chain_skipped_trusted_source\": %" PRIu64 ",\n"
+        "  \"chain_skipped_trusted_destination\": %" PRIu64 ",\n"
+        "  \"benchmark_region_entries\": %" PRIu64 ",\n"
+        "  \"benchmark_region_activations\": %" PRIu64 ",\n"
+        "  \"benchmark_tree_insertions\": %" PRIu64 ",\n"
         "  \"search_data_hits\": %" PRIu64 "\n}\n",
         sc7.loaded ? sc7.header.n_regions : 0,
         sc7.loaded ? sc7.header.n_members : 0,
@@ -1367,6 +1433,18 @@ static void sc7_write_stats(void)
         sc7.trusted_callback_replays, sc7.trusted_callbacks_executed,
         sc7.artifact_hash_validations,
         sc7.trusted_artifact_hash_validations,
+        sc7.try_region_calls, sc7.region_comparisons,
+        sc7.trusted_tb_calls, sc7.trusted_tb_comparisons,
+        sc7.trusted_tree_insertions,
+        sc7.chain_attempts, sc7.chain_allowed,
+        sc7.chain_installs,
+        sc7.chain_installs_trusted_destination,
+        sc7.chain_skipped_global,
+        sc7.chain_skipped_trusted_source,
+        sc7.chain_skipped_trusted_destination,
+        sc7.benchmark_region_entries,
+        sc7.benchmark_region_activations,
+        sc7.benchmark_tree_insertions,
         sc7.search_hits);
     if (!g_file_set_contents(sc7.stats_path, j->str, j->len, NULL)) {
         warn_report("supercache: cannot write QEMU_SC_V7_STATS file '%s'",
@@ -1377,6 +1455,30 @@ static void sc7_write_stats(void)
 static void sc7_configure_from_env(void)
 {
     const char *path = getenv("QEMU_SC_V7_STATS");
+    const char *experiment = getenv("QEMU_SC_V7_EXPERIMENT");
+
+    if (experiment && *experiment) {
+        g_auto(GStrv) tokens = g_strsplit(experiment, ",", -1);
+
+        for (char **token = tokens; *token; token++) {
+            if (!strcmp(*token, "source-index")) {
+                sc7.experiment_source_index = true;
+            } else if (!strcmp(*token, "trusted-set")) {
+                sc7.experiment_trusted_set = true;
+            } else if (!strcmp(*token, "no-tree")) {
+                sc7.experiment_no_tree = true;
+            } else if (!strcmp(*token, "incoming-chain")) {
+                sc7.experiment_incoming_chain = true;
+            } else if (!strcmp(*token, "disable-chaining")) {
+                sc7.experiment_disable_chaining = true;
+            } else if (!strcmp(*token, "no-regions")) {
+                sc7.experiment_no_regions = true;
+            } else {
+                error_report("QEMU_SC_V7_EXPERIMENT: unknown token '%s'", *token);
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
 
     if (!path || !*path) {
         return;
@@ -1386,6 +1488,7 @@ static void sc7_configure_from_env(void)
         exit(EXIT_FAILURE);
     }
     sc7.stats_path = g_strdup(path);
+    tcg_sc7_stats_active = true;
     atexit(sc7_write_stats);
 }
 
@@ -2614,25 +2717,60 @@ static TranslationBlock *sc7_build_trusted_entry(Sc7RegionEntry *region)
     sc7.member_prepared[entry] = true;
     flush_idcache_range((uintptr_t)tb->tc.ptr, (uintptr_t)tb->tc.ptr,
                         tb->tc.size);
-    tcg_tb_insert(tb);
+    if (!sc7.experiment_no_tree) {
+        tcg_tb_insert(tb);
+        sc7.trusted_tree_insertions++;
+        if (sc7.benchmark_window) {
+            sc7.benchmark_tree_insertions++;
+        }
+    }
     sc7.private_tbs[entry] = tb;
+    if (sc7.trusted_tbs) {
+        g_hash_table_add(sc7.trusted_tbs, tb);
+    }
     sc7.members_activated++;
     sc7.region_activations++;
     sc7.trusted_region_activations++;
     sc7.trusted_entry_descriptors_instantiated++;
+    if (sc7.benchmark_window) {
+        sc7.benchmark_region_activations++;
+    }
     return tb;
 }
 
 static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
 {
+    uint32_t region_begin = 0;
+    uint32_t region_end = sc7.header.n_regions;
+
     if (!sc7.loaded || scp_active || cpu->singlestep_enabled ||
         !QTAILQ_EMPTY(&cpu->breakpoints) || !QTAILQ_EMPTY(&cpu->watchpoints)) {
         return NULL;
     }
-    for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
+    if (sc7.stats_path) {
+        sc7.try_region_calls++;
+    }
+    if (sc7.experiment_no_regions) {
+        return NULL;
+    }
+    if (sc7.trusted && sc7.source_region) {
+        uint32_t region = source < supercache.entry_count ?
+                          sc7.source_region[source] : UINT32_MAX;
+
+        if (region == UINT32_MAX) {
+            return NULL;
+        }
+        region_begin = region;
+        region_end = region + 1;
+    }
+    for (uint32_t ri = region_begin; ri < region_end; ri++) {
         Sc7RegionEntry *region = &sc7.regions[ri];
 
-        if (sc7_source_index(region->source_tb_offset) != source) {
+        if (sc7.stats_path) {
+            sc7.region_comparisons++;
+        }
+        if (!sc7.source_region &&
+            sc7_source_index(region->source_tb_offset) != source) {
             continue;
         }
         if (sc7.trusted) {
@@ -2644,6 +2782,9 @@ static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
             entry = sc7_build_trusted_entry(region);
             sc7.entries++;
             sc7.internal_edges += region->n_edges;
+            if (sc7.benchmark_window) {
+                sc7.benchmark_region_entries++;
+            }
             return entry;
         }
         if (!sc7.region_admitted[ri]) {
@@ -2996,6 +3137,9 @@ static void write_restore_stats(void)
 void tcg_supercache_restore_window(bool started)
 {
     restore_stats_window = started;
+    if (sc7.stats_path) {
+        sc7.benchmark_window = started;
+    }
 }
 
 static bool restore_uint(const char *token, int base, uint64_t *value)
@@ -3397,19 +3541,81 @@ TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr)
                                 record->tb_offset);
 }
 
-bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
+static bool sc7_trusted_tb_lookup(const TranslationBlock *tb, bool count)
 {
     if (!sc7.loaded || !sc7.trusted) {
         return false;
     }
+    if (count && sc7.stats_path) {
+        sc7.trusted_tb_calls++;
+    }
+    if (sc7.trusted_tbs) {
+        return g_hash_table_contains(sc7.trusted_tbs, tb);
+    }
     for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
         uint32_t entry = sc7.regions[ri].first_member;
 
+        if (count && sc7.stats_path) {
+            sc7.trusted_tb_comparisons++;
+        }
         if (sc7.private_tbs[entry] == tb) {
             return true;
         }
     }
     return false;
+}
+
+bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
+{
+    return sc7_trusted_tb_lookup(tb, true);
+}
+
+bool tcg_supercache_chain_allowed(const TranslationBlock *from,
+                                  const TranslationBlock *to)
+{
+    bool from_trusted;
+    bool to_trusted;
+
+    if (sc7.stats_path) {
+        sc7.chain_attempts++;
+    }
+    if (sc7.experiment_disable_chaining) {
+        if (sc7.stats_path) {
+            sc7.chain_skipped_global++;
+        }
+        return false;
+    }
+    from_trusted = tcg_supercache_trusted_tb(from);
+    if (from_trusted) {
+        if (sc7.stats_path) {
+            sc7.chain_skipped_trusted_source++;
+        }
+        return false;
+    }
+    to_trusted = tcg_supercache_trusted_tb(to);
+    if (to_trusted && !sc7.experiment_incoming_chain) {
+        if (sc7.stats_path) {
+            sc7.chain_skipped_trusted_destination++;
+        }
+        return false;
+    }
+    if (sc7.stats_path) {
+        sc7.chain_allowed++;
+    }
+    return true;
+}
+
+void tcg_supercache_note_chain_result(const TranslationBlock *from,
+                                      const TranslationBlock *to,
+                                      bool installed)
+{
+    if (!sc7.stats_path || !installed) {
+        return;
+    }
+    sc7.chain_installs++;
+    if (sc7_trusted_tb_lookup(to, false)) {
+        sc7.chain_installs_trusted_destination++;
+    }
 }
 
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
@@ -3531,6 +3737,18 @@ bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
     return false;
 }
 
+bool tcg_supercache_chain_allowed(const TranslationBlock *from,
+                                  const TranslationBlock *to)
+{
+    return true;
+}
+
+void tcg_supercache_note_chain_result(const TranslationBlock *from,
+                                      const TranslationBlock *to,
+                                      bool installed)
+{
+}
+
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
 {
     return false;
@@ -3555,6 +3773,7 @@ bool tcg_supercache_get_info(TCGSupercacheInfo *info)
 }
 
 bool tcg_sc6_stats_active;
+bool tcg_sc7_stats_active;
 
 void tcg_supercache_mapping_changed(CPUState *cpu)
 {

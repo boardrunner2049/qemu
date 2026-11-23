@@ -24,6 +24,11 @@ TranslationBlock *tcg_supercache_lookup(CPUState *cpu, TCGTBCPUState state,
                                         tb_page_addr_t phys_pc);
 TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr);
 bool tcg_supercache_trusted_tb(const TranslationBlock *tb);
+bool tcg_supercache_chain_allowed(const TranslationBlock *from,
+                                  const TranslationBlock *to);
+void tcg_supercache_note_chain_result(const TranslationBlock *from,
+                                      const TranslationBlock *to,
+                                      bool installed);
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb);
 const uint8_t *tcg_supercache_search_data(const TranslationBlock *tb);
 bool tcg_supercache_code_invalidated(tb_page_addr_t start,
@@ -38,6 +43,7 @@ bool tcg_supercache_code_invalidated(tb_page_addr_t start,
  * called only while tcg_sc6_stats_active.
  */
 extern bool tcg_sc6_stats_active;
+extern bool tcg_sc7_stats_active;
 void tcg_supercache_mapping_changed(CPUState *cpu);
 void tcg_supercache_v6_one_insn_per_tb(void);
 void tcg_supercache_v6_note_exit(TranslationBlock *tb, int tb_exit);
@@ -110,6 +116,20 @@ static inline bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
     return false;
 }
 
+static inline bool
+tcg_supercache_chain_allowed(const TranslationBlock *from,
+                             const TranslationBlock *to)
+{
+    return true;
+}
+
+static inline void
+tcg_supercache_note_chain_result(const TranslationBlock *from,
+                                 const TranslationBlock *to,
+                                 bool installed)
+{
+}
+
 static inline const uint8_t *
 tcg_supercache_search_data(const TranslationBlock *tb)
 {
@@ -125,6 +145,7 @@ tcg_supercache_code_invalidated(tb_page_addr_t start,
 }
 
 #define tcg_sc6_stats_active false
+#define tcg_sc7_stats_active false
 static inline void tcg_supercache_mapping_changed(CPUState *cpu)
 {
 }

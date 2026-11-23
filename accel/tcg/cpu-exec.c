@@ -635,7 +635,7 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
 
-static inline void tb_add_jump(TranslationBlock *tb, int n,
+static inline bool tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
 {
     uintptr_t old;
@@ -666,10 +666,11 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 
     qemu_log_mask(CPU_LOG_EXEC, "Linking TBs %p index %d -> %p\n",
                   tb->tc.ptr, n, tb_next->tc.ptr);
-    return;
+    return true;
 
  out_unlock_next:
     qemu_spin_unlock(&tb_next->jmp_lock);
+    return false;
 }
 
 static inline bool cpu_handle_halt(CPUState *cpu)
@@ -1008,9 +1009,12 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * chains, so that every TB entry is observed.
              */
             if (last_tb && likely(!scp_active) &&
-                !tcg_supercache_trusted_tb(last_tb) &&
-                !tcg_supercache_trusted_tb(tb)) {
-                tb_add_jump(last_tb, tb_exit, tb);
+                tcg_supercache_chain_allowed(last_tb, tb)) {
+                bool installed = tb_add_jump(last_tb, tb_exit, tb);
+
+                if (unlikely(tcg_sc7_stats_active)) {
+                    tcg_supercache_note_chain_result(last_tb, tb, installed);
+                }
             }
             if (unlikely(scp_active)) {
                 scp_dispatch(cpu, tb, s.pc);                /* P1 */
