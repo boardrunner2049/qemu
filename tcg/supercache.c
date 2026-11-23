@@ -1081,7 +1081,8 @@ static void sc7_load_ext(void)
             i >= (uint64_t)r->first_member + r->n_members) {
             sc7_die("member %u is outside its declared region", i);
         }
-        search_size = supercache.entries[src].record.end_offset -
+        search_size = trusted ? 0 :
+                      supercache.entries[src].record.end_offset -
                       supercache.entries[src].record.tc_offset -
                       supercache.entries[src].record.tc_size;
         if (trusted &&
@@ -1152,7 +1153,8 @@ static void sc7_load_ext(void)
             Sc7MemberEntry *m = &sc7.members[mi];
             SupercacheRecord *s =
                 &supercache.entries[sc7.source_index[mi]].record;
-            uint64_t search_size = s->end_offset - s->tc_offset - s->tc_size;
+            uint64_t search_size = trusted ? 0 :
+                                   s->end_offset - s->tc_offset - s->tc_size;
 
             if (m->search_offset != search_next) {
                 sc7_die("region %u member search data is not contiguous", i);
