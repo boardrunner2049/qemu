@@ -875,6 +875,7 @@ static struct {
     TranslationBlock **private_tbs;
     uint32_t *source_index;
     uint64_t entries;
+    uint64_t members_activated;
     uint64_t dependency_refusals;
     uint64_t dependency_invalidations;
     uint64_t internal_edges;
@@ -883,6 +884,43 @@ static struct {
 } sc7;
 
 static void sc7_runtime_reset(void);
+static G_NORETURN G_GNUC_PRINTF(1, 2) void sc7_die(const char *fmt, ...);
+
+typedef struct Sc7Span {
+    uint64_t start;
+    uint64_t end;
+} Sc7Span;
+
+static int sc7_cmp_span(const void *ap, const void *bp)
+{
+    const Sc7Span *a = ap;
+    const Sc7Span *b = bp;
+
+    return a->start < b->start ? -1 : a->start > b->start ? 1 :
+           a->end < b->end ? -1 : a->end > b->end;
+}
+
+static bool sc7_range(uint64_t start, uint64_t size, uint64_t limit,
+                      uint64_t *end)
+{
+    if (start > limit || size > limit - start) {
+        return false;
+    }
+    *end = start + size;
+    return true;
+}
+
+static void sc7_check_disjoint(Sc7Span *spans, uint64_t count,
+                               const char *what)
+{
+    qsort(spans, count, sizeof(*spans), sc7_cmp_span);
+    for (uint64_t i = 1; i < count; i++) {
+        if (spans[i].start < spans[i - 1].end) {
+            sc7_die("%s spans overlap at 0x%" PRIx64, what,
+                    spans[i].start);
+        }
+    }
+}
 
 static uint32_t sc7_source_index(uint64_t tb_offset)
 {
@@ -910,7 +948,12 @@ static void sc7_load_ext(void)
 {
     Sc7DirHeader h;
     g_autofree uint8_t *table = NULL;
+    g_autofree Sc7Span *occupied = NULL;
+    g_autofree Sc7Span *region_spans = NULL;
     uint64_t expected, hash;
+    uint64_t table_end;
+    uint64_t n_occupied, next_occupied = 0;
+    uint32_t expected_member = 0, expected_edge = 0;
     uint8_t zero[8] = { 0 };
 
     if (supercache.header.reserved != SC7_FEAT_FIRMWARE_REGIONS) {
@@ -930,8 +973,10 @@ static void sc7_load_ext(void)
     expected = (uint64_t)h.n_regions * sizeof(Sc7RegionEntry) +
                (uint64_t)h.n_members * sizeof(Sc7MemberEntry) +
                (uint64_t)h.n_edges * sizeof(Sc7EdgeEntry);
-    if (h.table_size != expected || h.table_offset < supercache.header.prologue_end ||
-        h.max_end != h.table_offset + h.table_size || h.max_end >= supercache.size) {
+    if (h.table_offset % 8 || h.table_size != expected ||
+        h.table_offset < supercache.header.prologue_end ||
+        !sc7_range(h.table_offset, h.table_size, supercache.size,
+                   &table_end) || h.max_end != table_end) {
         sc7_die("directory bounds/count mismatch");
     }
     table = g_malloc(h.table_size ? h.table_size : 1);
@@ -952,40 +997,107 @@ static void sc7_load_ext(void)
                           h.n_edges * sizeof(Sc7EdgeEntry));
     sc7.private_tbs = g_new0(TranslationBlock *, h.n_members + 1);
     sc7.source_index = g_new(uint32_t, h.n_members + 1);
-    for (uint32_t i = 0; i < h.n_members; i++) {
-        Sc7MemberEntry *m = &sc7.members[i];
-        uint32_t src = sc7_source_index(m->source_tb_offset);
-
-        uint64_t search_size = src == UINT32_MAX ? 0 :
-            supercache.entries[src].record.end_offset -
-            supercache.entries[src].record.tc_offset -
-            supercache.entries[src].record.tc_size;
-
-        if (src == UINT32_MAX || m->region_index >= h.n_regions ||
-            m->tb_offset + sizeof(TranslationBlock) > m->tc_offset ||
-            m->tc_offset + m->tc_size > h.table_offset ||
-            m->search_offset + search_size > h.table_offset) {
-            sc7_die("member %u has invalid source or bounds", i);
-        }
-        sc7.source_index[i] = src;
-    }
+    region_spans = g_new(Sc7Span, (uint64_t)h.n_regions + 1);
     for (uint32_t i = 0; i < h.n_regions; i++) {
         Sc7RegionEntry *r = &sc7.regions[i];
+        uint64_t member_end = (uint64_t)r->first_member + r->n_members;
+        uint64_t edge_end = (uint64_t)r->first_edge + r->n_edges;
 
-        if (r->first_member + r->n_members > h.n_members ||
-            r->first_edge + r->n_edges > h.n_edges ||
-            r->entry_member >= r->n_members ||
+        if (r->flags || r->first_member != expected_member ||
+            r->first_edge != expected_edge || !r->n_members ||
+            member_end > h.n_members || edge_end > h.n_edges ||
+            r->entry_member >= r->n_members || r->start_offset % 64 ||
             sc7_source_index(r->source_tb_offset) == UINT32_MAX ||
             r->end_offset > h.table_offset || r->start_offset >= r->end_offset) {
             sc7_die("region %u has invalid slices", i);
         }
+        region_spans[i] = (Sc7Span) { r->start_offset, r->end_offset };
+        expected_member = member_end;
+        expected_edge = edge_end;
+    }
+    if (expected_member != h.n_members || expected_edge != h.n_edges) {
+        sc7_die("directory arrays are not partitioned by regions");
+    }
+    sc7_check_disjoint(region_spans, h.n_regions, "region");
+
+    n_occupied = (uint64_t)supercache.entry_count +
+                 (uint64_t)h.n_members * 3 + 1;
+    occupied = g_new(Sc7Span, n_occupied);
+    for (uint32_t i = 0; i < supercache.entry_count; i++) {
+        SupercacheRecord *r = &supercache.entries[i].record;
+
+        occupied[next_occupied++] = (Sc7Span) { r->tb_offset, r->end_offset };
+    }
+    occupied[next_occupied++] = (Sc7Span) { h.table_offset, h.max_end };
+    for (uint32_t i = 0; i < h.n_members; i++) {
+        Sc7MemberEntry *m = &sc7.members[i];
+        uint32_t src = sc7_source_index(m->source_tb_offset);
+        Sc7RegionEntry *r;
+        uint64_t descriptor_end, code_end, search_end, search_size;
+
+        if (src == UINT32_MAX || m->region_index >= h.n_regions || m->flags) {
+            sc7_die("member %u has invalid source, region, or flags", i);
+        }
+        r = &sc7.regions[m->region_index];
+        if (i < r->first_member ||
+            i >= (uint64_t)r->first_member + r->n_members) {
+            sc7_die("member %u is outside its declared region", i);
+        }
+        search_size = supercache.entries[src].record.end_offset -
+                      supercache.entries[src].record.tc_offset -
+                      supercache.entries[src].record.tc_size;
+        if (!m->tc_size ||
+            !sc7_range(m->tb_offset, supercache.header.tb_size,
+                       r->end_offset, &descriptor_end) ||
+            !sc7_range(m->tc_offset, m->tc_size, r->end_offset, &code_end) ||
+            !sc7_range(m->search_offset, search_size, r->end_offset,
+                       &search_end) ||
+            m->tb_offset < r->start_offset ||
+            m->tc_offset < r->start_offset ||
+            m->search_offset < r->start_offset) {
+            sc7_die("member %u has invalid descriptor/code/search bounds", i);
+        }
+        sc7.source_index[i] = src;
+        occupied[next_occupied++] =
+            (Sc7Span) { m->tb_offset, descriptor_end };
+        occupied[next_occupied++] =
+            (Sc7Span) { m->tc_offset, code_end };
+        occupied[next_occupied++] =
+            (Sc7Span) { m->search_offset, search_end };
+    }
+    g_assert(next_occupied == n_occupied);
+    sc7_check_disjoint(occupied, n_occupied, "arena");
+
+    for (uint32_t i = 0; i < h.n_regions; i++) {
+        Sc7RegionEntry *r = &sc7.regions[i];
+        uint32_t entry = r->first_member + r->entry_member;
+
+        if (sc7.members[entry].source_tb_offset != r->source_tb_offset) {
+            sc7_die("region %u entry source record mismatch", i);
+        }
     }
     for (uint32_t i = 0; i < h.n_edges; i++) {
         Sc7EdgeEntry *e = &sc7.edges[i];
+        Sc7RegionEntry *r;
+        Sc7MemberEntry *source;
+        uint64_t member_end;
 
-        if (e->region_index >= h.n_regions || e->source_member >= h.n_members ||
-            e->target_member >= h.n_members || e->reserved) {
-            sc7_die("edge %u has invalid member", i);
+        if (e->region_index >= h.n_regions || e->kind != 1 || e->flags ||
+            e->reserved) {
+            sc7_die("edge %u has invalid kind, flags, or region", i);
+        }
+        r = &sc7.regions[e->region_index];
+        member_end = (uint64_t)r->first_member + r->n_members;
+        if (i < r->first_edge || i >= (uint64_t)r->first_edge + r->n_edges ||
+            e->source_member < r->first_member ||
+            e->source_member >= member_end ||
+            e->target_member < r->first_member ||
+            e->target_member >= member_end) {
+            sc7_die("edge %u is outside its declared region", i);
+        }
+        source = &sc7.members[e->source_member];
+        if (source->tc_size < 4 || e->field_offset > source->tc_size - 4) {
+            sc7_die("edge %u field is outside source code", i);
         }
     }
     sc7.header = h;
@@ -996,18 +1108,76 @@ static void sc7_load_ext(void)
 static void sc7_verify_hashes(void)
 {
     uint8_t *buf = supercache.buffer;
+    GChecksum *artifact = g_checksum_new(G_CHECKSUM_SHA256);
+    static const uint8_t domain[] = "scopt.sc7/1";
+    uint8_t artifact_digest[32];
+    gsize artifact_len = sizeof(artifact_digest);
+    uint8_t zero_id[8] = { 0 };
+
+    g_checksum_update(artifact, domain, sizeof(domain) - 1);
+    g_checksum_update(artifact, (const uint8_t *)sc7.regions,
+                      (gsize)sc7.header.n_regions * sizeof(Sc7RegionEntry));
+    g_checksum_update(artifact, (const uint8_t *)sc7.members,
+                      (gsize)sc7.header.n_members * sizeof(Sc7MemberEntry));
+    g_checksum_update(artifact, (const uint8_t *)sc7.edges,
+                      (gsize)sc7.header.n_edges * sizeof(Sc7EdgeEntry));
 
     for (uint32_t i = 0; i < sc7.header.n_members; i++) {
         Sc7MemberEntry *m = &sc7.members[i];
         SupercacheRecord *s = &supercache.entries[sc7.source_index[i]].record;
         uint64_t search_size = s->end_offset - s->tc_offset - s->tc_size;
+        GChecksum *member = g_checksum_new(G_CHECKSUM_SHA256);
+        uint8_t member_digest[32];
+        gsize member_len = sizeof(member_digest);
+        bool descriptor_zero = true;
 
-        if (hash_bytes(SUPERCACHE_FNV_OFFSET, buf + m->tc_offset, m->tc_size) !=
+        for (uint32_t n = 0; n < supercache.header.tb_size; n++) {
+            if (buf[m->tb_offset + n]) {
+                descriptor_zero = false;
+                break;
+            }
+        }
+
+        if (!descriptor_zero ||
+            hash_bytes(SUPERCACHE_FNV_OFFSET, buf + m->tc_offset, m->tc_size) !=
                 m->code_fnv64 ||
             hash_bytes(SUPERCACHE_FNV_OFFSET, buf + m->search_offset, search_size) !=
                 m->search_fnv64) {
-            sc7_die("member %u code/search hash mismatch", i);
+            g_checksum_free(member);
+            g_checksum_free(artifact);
+            sc7_die("member %u descriptor/code/search mismatch", i);
         }
+        g_checksum_update(member, buf + m->tb_offset,
+                          supercache.header.tb_size);
+        g_checksum_update(member, buf + m->tc_offset, m->tc_size);
+        g_checksum_update(member, buf + m->search_offset, search_size);
+        g_checksum_get_digest(member, member_digest, &member_len);
+        g_assert(member_len == sizeof(member_digest));
+        g_checksum_update(artifact, member_digest, sizeof(member_digest));
+        g_checksum_free(member);
+    }
+    for (uint32_t i = 0; i < sc7.header.n_edges; i++) {
+        Sc7EdgeEntry *e = &sc7.edges[i];
+        Sc7MemberEntry *source = &sc7.members[e->source_member];
+        Sc7MemberEntry *target = &sc7.members[e->target_member];
+        int32_t displacement;
+        int64_t next = source->tc_offset + e->field_offset + 4;
+
+        memcpy(&displacement, buf + source->tc_offset + e->field_offset,
+               sizeof(displacement));
+        if (next + displacement < 0 ||
+            (uint64_t)(next + displacement) != target->tc_offset) {
+            g_checksum_free(artifact);
+            sc7_die("edge %u rel32 target mismatch", i);
+        }
+    }
+    g_checksum_get_digest(artifact, artifact_digest, &artifact_len);
+    g_checksum_free(artifact);
+    if (artifact_len != sizeof(artifact_digest) ||
+        !memcmp(sc7.header.artifact_id8, zero_id, sizeof(zero_id)) ||
+        memcmp(sc7.header.artifact_id8, artifact_digest,
+               sizeof(sc7.header.artifact_id8))) {
+        sc7_die("directory artifact identity mismatch");
     }
 }
 
@@ -1029,13 +1199,15 @@ static void sc7_write_stats(void)
         "  \"regions_loaded\": %" PRIu32 ",\n"
         "  \"members_loaded\": %" PRIu32 ",\n"
         "  \"region_entries\": %" PRIu64 ",\n"
+        "  \"members_activated\": %" PRIu64 ",\n"
         "  \"internal_edges_admitted\": %" PRIu64 ",\n"
         "  \"dependency_refusals\": %" PRIu64 ",\n"
         "  \"dependency_invalidations\": %" PRIu64 ",\n"
         "  \"search_data_hits\": %" PRIu64 "\n}\n",
         sc7.loaded ? sc7.header.n_regions : 0,
         sc7.loaded ? sc7.header.n_members : 0,
-        sc7.entries, sc7.internal_edges, sc7.dependency_refusals,
+        sc7.entries, sc7.members_activated, sc7.internal_edges,
+        sc7.dependency_refusals,
         sc7.dependency_invalidations, sc7.search_hits);
     if (!g_file_set_contents(sc7.stats_path, j->str, j->len, NULL)) {
         warn_report("supercache: cannot write QEMU_SC_V7_STATS file '%s'",
@@ -2153,6 +2325,7 @@ static TranslationBlock *sc7_build_member(CPUState *cpu, uint32_t index)
                         tb->tc.size);
     tcg_tb_insert(tb);
     sc7.private_tbs[index] = tb;
+    sc7.members_activated++;
     return tb;
 }
 
