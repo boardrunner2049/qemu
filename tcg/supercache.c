@@ -123,6 +123,8 @@ static struct {
     bool initialized;
     bool flat;
     bool sealed;
+    bool user_trusted;
+    uint64_t record_checksum_checks;
     bool sealed_skip_irq;
     bool exact_pc;
 } supercache = {
@@ -338,6 +340,7 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads)
 {
     const char *sealed = getenv("QEMU_SC_SEALED");
+    const char *user_trusted = getenv("QEMU_SC_TRUSTED");
     const char *sealed_skip_irq = getenv("QEMU_SC_SEALED_SKIP_IRQ");
 
     if (!path) {
@@ -369,6 +372,11 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
         error_report("QEMU_SC_SEALED_SKIP_IRQ requires QEMU_SC_SEALED=1");
         exit(EXIT_FAILURE);
     }
+    if (user_trusted && strcmp(user_trusted, "1")) {
+        error_report("QEMU_SC_TRUSTED must be exactly 1 when set");
+        exit(EXIT_FAILURE);
+    }
+    supercache.user_trusted = user_trusted != NULL;
     supercache.sealed = sealed != NULL;
     supercache.sealed_skip_irq = sealed_skip_irq != NULL;
     supercache.exact_pc = supercache.sealed || getenv("QEMU_SCOPT_SEALED_RANGES");
@@ -471,9 +479,13 @@ static void load_records(void)
 
     for (uint64_t i = 0; i < count; i++) {
         const SupercacheRecord *record = &records[i];
+        bool invalid = record->committed != SUPERCACHE_RECORD_COMMIT;
 
-        if (record->committed != SUPERCACHE_RECORD_COMMIT ||
-            record->checksum != record_checksum(record) ||
+        if (!invalid && !supercache.user_trusted) {
+            supercache.record_checksum_checks++;
+            invalid = record->checksum != record_checksum(record);
+        }
+        if (invalid ||
             record->tb_offset > supercache.size - sizeof(TranslationBlock) ||
             record->tb_offset >= record->tc_offset ||
             record->tc_offset >= record->end_offset ||
@@ -1076,10 +1088,12 @@ static void sc7_load_ext(void)
                               SUPERCACHE_CODE_OFFSET + h.table_offset) != h.table_size) {
         sc7_die("cannot read directory table");
     }
-    hash = hash_bytes(SUPERCACHE_FNV_OFFSET, &h, offsetof(Sc7DirHeader, checksum));
-    hash = hash_bytes(hash, table, h.table_size);
-    if (hash != h.checksum) {
-        sc7_die("directory checksum mismatch");
+    if (!supercache.user_trusted) {
+        hash = hash_bytes(SUPERCACHE_FNV_OFFSET, &h, offsetof(Sc7DirHeader, checksum));
+        hash = hash_bytes(hash, table, h.table_size);
+        if (hash != h.checksum) {
+            sc7_die("directory checksum mismatch");
+        }
     }
     sc7.regions = g_memdup2(table, h.n_regions * sizeof(Sc7RegionEntry));
     sc7.members = g_memdup2(table + h.n_regions * sizeof(Sc7RegionEntry),
@@ -1307,22 +1321,25 @@ static void sc7_verify_hashes(void)
                 sc7_die("trusted member %u lacks the verified entry prefix", i);
             }
         }
-        for (uint32_t i = 0; i < sc7.header.n_edges; i++) {
-            Sc7EdgeEntry *e = &sc7.edges[i];
-            Sc7MemberEntry *source = &sc7.members[e->source_member];
-            Sc7MemberEntry *target = &sc7.members[e->target_member];
-            int32_t displacement;
-            int64_t next = source->tc_offset + e->field_offset + 4;
-            uint64_t expected = target->tc_offset + SC7_TRUSTED_BODY_OFFSET;
+    }
+    for (uint32_t i = 0; i < sc7.header.n_edges; i++) {
+        Sc7EdgeEntry *e = &sc7.edges[i];
+        Sc7MemberEntry *source = &sc7.members[e->source_member];
+        Sc7MemberEntry *target = &sc7.members[e->target_member];
+        int32_t displacement;
+        int64_t next = source->tc_offset + e->field_offset + 4;
+        uint64_t expected = target->tc_offset +
+                            (sc7.trusted ? SC7_TRUSTED_BODY_OFFSET : 0);
 
-            memcpy(&displacement,
-                   buf + source->tc_offset + e->field_offset,
-                   sizeof(displacement));
-            if (next + displacement < 0 ||
-                (uint64_t)(next + displacement) != expected) {
-                sc7_die("trusted edge %u rel32 target mismatch", i);
-            }
+        memcpy(&displacement,
+               buf + source->tc_offset + e->field_offset,
+               sizeof(displacement));
+        if (next + displacement < 0 ||
+            (uint64_t)(next + displacement) != expected) {
+            sc7_die("edge %u rel32 target mismatch", i);
         }
+    }
+    if (sc7.trusted || supercache.user_trusted) {
         return;
     }
 
@@ -1370,21 +1387,6 @@ static void sc7_verify_hashes(void)
         g_checksum_update(artifact, member_digest, sizeof(member_digest));
         g_checksum_free(member);
     }
-    for (uint32_t i = 0; i < sc7.header.n_edges; i++) {
-        Sc7EdgeEntry *e = &sc7.edges[i];
-        Sc7MemberEntry *source = &sc7.members[e->source_member];
-        Sc7MemberEntry *target = &sc7.members[e->target_member];
-        int32_t displacement;
-        int64_t next = source->tc_offset + e->field_offset + 4;
-
-        memcpy(&displacement, buf + source->tc_offset + e->field_offset,
-               sizeof(displacement));
-        if (next + displacement < 0 ||
-            (uint64_t)(next + displacement) != target->tc_offset) {
-            g_checksum_free(artifact);
-            sc7_die("edge %u rel32 target mismatch", i);
-        }
-    }
     g_checksum_get_digest(artifact, artifact_digest, &artifact_len);
     g_checksum_free(artifact);
     if (artifact_len != sizeof(artifact_digest) ||
@@ -1402,6 +1404,10 @@ static void sc7_write_stats(void)
     g_string_append(j, "  \"schema\": \"qemu-sc-v7-stats@1\",\n");
     g_string_append_printf(j, "  \"loaded\": %s,\n",
                            sc7.loaded ? "true" : "false");
+    g_string_append_printf(j, "  \"user_trusted_input\": %s,\n"
+                           "  \"public_record_checksum_checks\": %" PRIu64 ",\n",
+                           supercache.user_trusted ? "true" : "false",
+                           supercache.record_checksum_checks);
     g_string_append_printf(j, "  \"mode\": \"%s\",\n",
                            sc7.trusted ? "trusted" : "safe");
     g_string_append_printf(j,
@@ -1684,11 +1690,13 @@ static void sc6_load_ext(uint32_t features)
         !pread_full(supercache.fd, arrays, arrays_size, SC6_ARRAYS_OFFSET)) {
         sc6_die("cannot read the extension arrays");
     }
-    hash = hash_bytes(SUPERCACHE_FNV_OFFSET, &x,
-                      offsetof(Sc6ExtHeader, checksum));
-    hash = hash_bytes(hash, arrays, arrays_size);
-    if (hash != x.checksum) {
-        sc6_die("ext checksum mismatch");
+    if (!supercache.user_trusted) {
+        hash = hash_bytes(SUPERCACHE_FNV_OFFSET, &x,
+                          offsetof(Sc6ExtHeader, checksum));
+        hash = hash_bytes(hash, arrays, arrays_size);
+        if (hash != x.checksum) {
+            sc6_die("ext checksum mismatch");
+        }
     }
     if (!!(features & SC6_FEAT_VARIANTS) != !!x.n_variants) {
         sc6_die("feature VARIANTS disagrees with n_variants %" PRIu32,
@@ -1921,6 +1929,9 @@ static void sc6_verify_hashes(void)
 {
     const uint8_t *buf = supercache.buffer;
 
+    if (supercache.user_trusted) {
+        return;
+    }
     for (uint32_t i = 0; i < sc6.n_variants; i++) {
         const Sc6VariantEntry *e = &sc6.variants[i].e;
 
@@ -2858,9 +2869,16 @@ static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
                     &supercache.entries[sc7.source_index[mi]];
                 SupercacheRecord *r = &dep->record;
 
+                if (dep->invalid) {
+                    sc7.dependency_refusals++;
+                    return NULL;
+                }
+                if (supercache.user_trusted) {
+                    continue;
+                }
                 sc7.guest_hash_checks++;
-                if (dep->invalid || guest_hash(r->page_addr0, r->page_addr1,
-                                               r->guest_size) != r->guest_hash) {
+                if (guest_hash(r->page_addr0, r->page_addr1,
+                               r->guest_size) != r->guest_hash) {
                     sc7.dependency_refusals++;
                     return NULL;
                 }
@@ -3403,8 +3421,8 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     if (!supercache.sealed && !second_page_matches(cpu, state, r)) {
         return NULL;
     }
-    if (!sc7.trusted && !supercache.sealed) {
-        sc7.guest_hash_checks += sc7.loaded;
+    if (!sc7.trusted && !supercache.sealed && !supercache.user_trusted) {
+        sc7.guest_hash_checks++;
         if (guest_hash(r->page_addr0, r->page_addr1,
                        r->guest_size) != r->guest_hash) {
             return NULL;
