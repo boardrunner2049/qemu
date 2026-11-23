@@ -1192,42 +1192,6 @@ static void sc7_load_ext(void)
             sc7_die("edge %u field is outside source code", i);
         }
     }
-    if (trusted) {
-        for (uint32_t ri = 0; ri < h.n_regions; ri++) {
-            Sc7RegionEntry *r = &sc7.regions[ri];
-            g_autofree uint32_t *indegree =
-                g_new0(uint32_t, r->n_members);
-            g_autofree uint32_t *queue = g_new(uint32_t, r->n_members);
-            uint32_t head = 0, tail = 0, visited = 0;
-
-            for (uint32_t n = 0; n < r->n_edges; n++) {
-                Sc7EdgeEntry *e = &sc7.edges[r->first_edge + n];
-
-                indegree[e->target_member - r->first_member]++;
-            }
-            for (uint32_t n = 0; n < r->n_members; n++) {
-                if (!indegree[n]) {
-                    queue[tail++] = n;
-                }
-            }
-            while (head < tail) {
-                uint32_t member = queue[head++] + r->first_member;
-
-                visited++;
-                for (uint32_t n = 0; n < r->n_edges; n++) {
-                    Sc7EdgeEntry *e = &sc7.edges[r->first_edge + n];
-                    uint32_t target = e->target_member - r->first_member;
-
-                    if (e->source_member == member && !--indegree[target]) {
-                        queue[tail++] = target;
-                    }
-                }
-            }
-            if (visited != r->n_members) {
-                sc7_die("trusted region %u has a cyclic internal edge", ri);
-            }
-        }
-    }
     sc7.header = h;
     sc7.trusted = trusted;
     sc7.loaded = true;
