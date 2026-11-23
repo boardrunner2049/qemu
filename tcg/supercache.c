@@ -33,9 +33,7 @@
 #include <sys/file.h>
 
 #define SUPERCACHE_MAGIC          "QSCACHE1"
-#define SUPERCACHE_VERSION        5
-#define SC6_VERSION               6       /* .sc v6 (WP22) */
-#define SC7_VERSION               7       /* firmware regions */
+#define SC7_VERSION               7       /* canonical top-level cache */
 #define SUPERCACHE_CODE_OFFSET    (64 * KiB)
 #define SUPERCACHE_RECORD_COMMIT  0x53435231U
 #define SUPERCACHE_FNV_OFFSET     UINT64_C(1469598103934665603)
@@ -401,9 +399,7 @@ static bool valid_header(const SupercacheHeader *header, size_t size,
                          uint64_t signature)
 {
     return memcmp(header->magic, SUPERCACHE_MAGIC, 8) == 0 &&
-           (header->version == SUPERCACHE_VERSION ||
-            header->version == SC6_VERSION ||
-            header->version == SC7_VERSION) &&
+           header->version == SC7_VERSION &&
            header->header_size == sizeof(*header) &&
            header->checksum == header_checksum(header) &&
            header->code_size == size &&
@@ -806,6 +802,10 @@ static struct {
 #define SC7_DIR_OFFSET            0x100
 #define SC7_DIR_MAGIC             "QSC7FWRG"
 #define SC7_FEAT_FIRMWARE_REGIONS 1u
+/* The payload at 0x100 uses the legacy v6 semantic-extension layout.  The
+ * remaining low bits are the SC6_FEAT_* flags and are validated by the v6
+ * loader after this top-level marker is removed. */
+#define SC7_FEAT_SC6_EXTENSION    (1u << 31)
 #define SC7_DIR_VERSION_COMPOSITE 2u
 #define SC7_DIR_VERSION_TRUSTED   3u
 #define SC7_REGION_COMPOSITE      1u
@@ -1521,6 +1521,9 @@ static G_NORETURN G_GNUC_PRINTF(1, 2) void sc6_die(const char *fmt, ...)
 static const char *header_problem(const SupercacheHeader *header, size_t size,
                                   uint64_t signature)
 {
+    if (header->version != SC7_VERSION) {
+        return "version";
+    }
     if (header->header_size != sizeof(*header)) {
         return "header_size";
     }
@@ -1583,11 +1586,12 @@ static bool sc6_ranges_overlap(uint64_t a0, uint64_t a1,
 
 /*
  * Q2: parse and validate the extension table (design §5.3, §5.4).  Called
- * in the reuse branch of tcg_supercache_alloc_code_buffer() after
- * load_records() and before loaded_max_end is set.  Every failure exits.
+ * for a v7 file carrying SC7_FEAT_SC6_EXTENSION, in the reuse branch of
+ * tcg_supercache_alloc_code_buffer() after load_records() and before
+ * loaded_max_end is set.  Every failure exits.
  * The two code hashes are checked later, after the code pread (Q4).
  */
-static void sc6_load_ext(void)
+static void sc6_load_ext(uint32_t features)
 {
     const SupercacheHeader *h = &supercache.header;
     int64_t t0 = g_get_monotonic_time();
@@ -1599,11 +1603,11 @@ static void sc6_load_ext(void)
     uint32_t n = supercache.entry_count;
     const size_t tb_struct = ROUND_UP(sizeof(TranslationBlock), 64);
 
-    if (h->reserved & ~SC6_KNOWN_FEATURES) {
+    if (features & ~SC6_KNOWN_FEATURES) {
         sc6_die("unknown feature bits 0x%" PRIx32,
-                h->reserved & ~SC6_KNOWN_FEATURES);
+                features & ~SC6_KNOWN_FEATURES);
     }
-    if (!(h->reserved & SC6_FEAT_EXT_TABLE)) {
+    if (!(features & SC6_FEAT_EXT_TABLE)) {
         sc6_die("feature EXT_TABLE clear");
     }
     if (supercache.flat) {
@@ -1650,11 +1654,11 @@ static void sc6_load_ext(void)
     if (hash != x.checksum) {
         sc6_die("ext checksum mismatch");
     }
-    if (!!(h->reserved & SC6_FEAT_VARIANTS) != !!x.n_variants) {
+    if (!!(features & SC6_FEAT_VARIANTS) != !!x.n_variants) {
         sc6_die("feature VARIANTS disagrees with n_variants %" PRIu32,
                 x.n_variants);
     }
-    if (!!(h->reserved & SC6_FEAT_GUARDED_SLOTS) != !!x.n_slots) {
+    if (!!(features & SC6_FEAT_GUARDED_SLOTS) != !!x.n_slots) {
         sc6_die("feature GUARDED_SLOTS disagrees with n_slots %" PRIu32,
                 x.n_slots);
     }
@@ -1686,7 +1690,7 @@ static void sc6_load_ext(void)
     sc6.links = g_new0(Sc6Link, x.n_links + 1);
     sc6.live = g_new0(TranslationBlock *, n + 1);
     sc6.role = g_new0(uint8_t, n + 1);
-    sc6.features = h->reserved;
+    sc6.features = features;
 
     floor = ROUND_UP(h->prologue_end, 64);
     limit = supercache.size - qemu_real_host_page_size() - 1024;
@@ -2405,10 +2409,8 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
         if (valid_header(&disk_header, size, signature)) {
             reuse = true;
             supercache.header = disk_header;
-        } else if (memcmp(disk_header.magic, SUPERCACHE_MAGIC, 8) == 0 &&
-                   (disk_header.version == SC6_VERSION ||
-                    disk_header.version == SC7_VERSION)) {
-            /* The stock path below truncates; say so for extension files. */
+        } else if (memcmp(disk_header.magic, SUPERCACHE_MAGIC, 8) == 0) {
+            /* The path below truncates every non-canonical cache; say so. */
             warn_report("supercache: discarding v%u file: %s", disk_header.version,
                         header_problem(&disk_header, size, signature));
         }
@@ -2423,7 +2425,10 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
         }
         memset(&supercache.header, 0, sizeof(supercache.header));
         memcpy(supercache.header.magic, SUPERCACHE_MAGIC, 8);
-        supercache.header.version = SUPERCACHE_VERSION;
+        /* Every cache created by this runtime uses the canonical top-level
+         * v7 public-record format. */
+        supercache.header.version = SC7_VERSION;
+        supercache.header.reserved = 0;
         supercache.header.header_size = sizeof(supercache.header);
         supercache.header.code_size = size;
         supercache.header.runtime_signature = signature;
@@ -2443,10 +2448,16 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
     if (reuse) {
         load_records();
         flat_index_init();
-        if (supercache.header.version == SC6_VERSION) {
-            sc6_load_ext();                         /* Q2, Q3, Q4 */
-        } else if (supercache.header.version == SC7_VERSION) {
-            sc7_load_ext();
+        if (supercache.header.version == SC7_VERSION) {
+            uint32_t features = supercache.header.reserved;
+
+            if (features & SC7_FEAT_SC6_EXTENSION) {
+                sc6_load_ext(features & ~SC7_FEAT_SC6_EXTENSION);
+            } else if (features & SC7_FEAT_FIRMWARE_REGIONS) {
+                sc7_load_ext();
+            } else if (features) {
+                sc7_die("unknown feature bits 0x%x", features);
+            }
         }
         supercache.loaded_max_end = supercache.max_end;
         supercache.loaded_header = disk_header;
@@ -3224,7 +3235,8 @@ static void init_restore_hints(void)
         restore_stats_path = NULL;
     }
     if ((mode && strcmp(mode, "verified")) || supercache.flat ||
-        h->version != SUPERCACHE_VERSION || h->record_count > UINT32_MAX ||
+        !(h->version == SC7_VERSION && h->reserved == 0) ||
+        h->record_count > UINT32_MAX ||
         !h->record_count) {
         return;
     }
