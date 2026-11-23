@@ -138,8 +138,12 @@ static int cpu_unwind_data_from_tb(TranslationBlock *tb, uintptr_t host_pc,
                                    uint64_t *data)
 {
     uintptr_t iter_pc = (uintptr_t)tb->tc.ptr;
-    const uint8_t *p = tb->tc.ptr + tb->tc.size;
+    const uint8_t *p = tcg_supercache_search_data(tb);
     int i, j, num_insns = tb->icount;
+
+    if (!p) {
+        p = tb->tc.ptr + tb->tc.size;
+    }
 
     host_pc -= GETPC_ADJ;
 

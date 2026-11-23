@@ -877,6 +877,8 @@ void tb_unlink_jump(TranslationBlock *tb, int n)
 }
 
 /* remove any jumps to the TB */
+static void tb_jmp_cache_inval_tb(TranslationBlock *tb);
+
 static inline void tb_jmp_unlink(TranslationBlock *dest)
 {
     TranslationBlock *tb;
@@ -892,6 +894,29 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     dest->jmp_list_head = (uintptr_t)NULL;
 
     qemu_spin_unlock(&dest->jmp_lock);
+}
+
+/* Private SuperCache TBs live in the host-PC tree and jump lists, but not in
+ * the QHT or guest-page TB lists.  Retire those bindings without taking the
+ * ordinary qht_remove() early return in do_tb_phys_invalidate().  The caller
+ * removes non-private outgoing jumps before calling this helper. */
+void tb_supercache_invalidate_private(TranslationBlock *tb)
+{
+    qemu_spin_lock(&tb->jmp_lock);
+    qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
+    qemu_spin_unlock(&tb->jmp_lock);
+    tb_jmp_cache_inval_tb(tb);
+    tb_jmp_unlink(tb);
+    tcg_tb_remove(tb);
+}
+
+/* A private TB is deliberately absent from PageDesc.first_tb.  Still create
+ * the descriptor and write-protect the dependency page so a guest code write
+ * reaches the SuperCache reverse-dependency hook below. */
+void tb_supercache_protect_code(tb_page_addr_t addr)
+{
+    page_find_alloc(addr >> TARGET_PAGE_BITS, true);
+    tlb_protect_code(addr & TARGET_PAGE_MASK);
 }
 
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
@@ -1137,12 +1162,24 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
     PageForEachNext n;
     bool current_tb_modified = false;
     TranslationBlock *current_tb = NULL;
+    TranslationBlock *retaddr_tb = NULL;
 
     /* Range may not cross a page. */
     tcg_debug_assert(((start ^ last) & TARGET_PAGE_MASK) == 0);
 
-    if (retaddr && cpu && cpu->cc->tcg_ops->precise_smc) {
-        current_tb = tcg_tb_lookup(retaddr);
+    if (retaddr && cpu) {
+        retaddr_tb = tcg_tb_lookup(retaddr);
+        if (cpu->cc->tcg_ops->precise_smc) {
+            current_tb = retaddr_tb;
+        }
+    }
+
+    /* Private firmware regions are not PageDesc members.  Invalidate every
+     * region depending on this source range, and conservatively leave a
+     * currently executing affected region at this write boundary. */
+    if (tcg_supercache_code_invalidated(start, last, retaddr_tb)) {
+        current_tb_modified = true;
+        cpu_restore_state_from_tb(cpu, retaddr_tb, retaddr);
     }
 
     /*

@@ -24,6 +24,10 @@ TranslationBlock *tcg_supercache_lookup(CPUState *cpu, TCGTBCPUState state,
                                         tb_page_addr_t phys_pc);
 TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr);
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb);
+const uint8_t *tcg_supercache_search_data(const TranslationBlock *tb);
+bool tcg_supercache_code_invalidated(tb_page_addr_t start,
+                                     tb_page_addr_t last,
+                                     TranslationBlock *current_tb);
 
 /*
  * .sc v6 loader (WP22, design/B3-B4-design.md §5.5-5.8).
@@ -96,6 +100,20 @@ tcg_supercache_host_lookup(uintptr_t tc_ptr)
 }
 
 static inline bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
+{
+    return false;
+}
+
+static inline const uint8_t *
+tcg_supercache_search_data(const TranslationBlock *tb)
+{
+    return NULL;
+}
+
+static inline bool
+tcg_supercache_code_invalidated(tb_page_addr_t start,
+                                tb_page_addr_t last,
+                                TranslationBlock *current_tb)
 {
     return false;
 }

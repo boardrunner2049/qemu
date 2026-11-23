@@ -34,6 +34,7 @@
 #define SUPERCACHE_MAGIC          "QSCACHE1"
 #define SUPERCACHE_VERSION        5
 #define SC6_VERSION               6       /* .sc v6 (WP22) */
+#define SC7_VERSION               7       /* firmware regions */
 #define SUPERCACHE_CODE_OFFSET    (64 * KiB)
 #define SUPERCACHE_RECORD_COMMIT  0x53435231U
 #define SUPERCACHE_FNV_OFFSET     UINT64_C(1469598103934665603)
@@ -322,6 +323,7 @@ static void sync_cache(void)
 }
 
 static void sc6_configure_from_env(void);
+static void sc7_configure_from_env(void);
 
 /* scc H1 needs to reject supercache-flat; see tcg/sc-capture.c. */
 bool tcg_supercache_flat_requested(void)
@@ -350,6 +352,7 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
     supercache.configured = true;
     supercache.flat = flat;
     sc6_configure_from_env();
+    sc7_configure_from_env();
     scc_configure_from_env();
     scp_configure_from_env();
 }
@@ -398,7 +401,8 @@ static bool valid_header(const SupercacheHeader *header, size_t size,
 {
     return memcmp(header->magic, SUPERCACHE_MAGIC, 8) == 0 &&
            (header->version == SUPERCACHE_VERSION ||
-            header->version == SC6_VERSION) &&
+            header->version == SC6_VERSION ||
+            header->version == SC7_VERSION) &&
            header->header_size == sizeof(*header) &&
            header->checksum == header_checksum(header) &&
            header->code_size == size &&
@@ -794,6 +798,265 @@ static struct {
 
 #define SC6_ROLE_SRC      1     /* R of some guarded slot */
 #define SC6_ROLE_GENERAL  2     /* C of some variant */
+
+/* V7: call-site-specific private firmware regions.  The directory itself is
+ * arena-resident so exhaustive mode does not inherit v6's 64 KiB array cap. */
+#define SC7_DIR_OFFSET            0x100
+#define SC7_DIR_MAGIC             "QSC7FWRG"
+#define SC7_FEAT_FIRMWARE_REGIONS 1u
+
+typedef struct Sc7DirHeader {
+    char magic[8];
+    uint32_t ext_version;
+    uint32_t header_size;
+    uint32_t n_regions;
+    uint32_t n_members;
+    uint32_t n_edges;
+    uint32_t region_entry_size;
+    uint64_t table_offset;
+    uint64_t table_size;
+    uint64_t max_end;
+    uint8_t artifact_id8[8];
+    uint64_t checksum;
+    uint8_t reserved[8];
+} Sc7DirHeader;
+
+typedef struct Sc7RegionEntry {
+    uint8_t region_id8[8];
+    uint8_t callsite_id8[8];
+    uint32_t entry_member;
+    uint32_t first_member;
+    uint32_t n_members;
+    uint32_t first_edge;
+    uint64_t source_tb_offset;
+    uint64_t start_offset;
+    uint64_t end_offset;
+    uint32_t n_edges;
+    uint32_t flags;
+} Sc7RegionEntry;
+
+typedef struct Sc7MemberEntry {
+    uint64_t source_tb_offset;
+    uint64_t tb_offset;
+    uint64_t tc_offset;
+    uint64_t tc_size;
+    uint64_t search_offset;
+    uint64_t code_fnv64;
+    uint64_t search_fnv64;
+    uint64_t guest_vaddr;
+    uint8_t context_id8[8];
+    uint32_t region_index;
+    uint32_t flags;
+} Sc7MemberEntry;
+
+typedef struct Sc7EdgeEntry {
+    uint32_t region_index;
+    uint32_t source_member;
+    uint32_t target_member;
+    uint32_t field_offset;
+    uint8_t kind;
+    uint8_t flags;
+    uint16_t reserved;
+    uint32_t guest_target;
+    uint64_t exit_id_fnv64;
+} Sc7EdgeEntry;
+
+QEMU_BUILD_BUG_ON(sizeof(Sc7DirHeader) != 80);
+QEMU_BUILD_BUG_ON(sizeof(Sc7RegionEntry) != 64);
+QEMU_BUILD_BUG_ON(sizeof(Sc7MemberEntry) != 80);
+QEMU_BUILD_BUG_ON(sizeof(Sc7EdgeEntry) != 32);
+
+static struct {
+    bool loaded;
+    Sc7DirHeader header;
+    Sc7RegionEntry *regions;
+    Sc7MemberEntry *members;
+    Sc7EdgeEntry *edges;
+    TranslationBlock **private_tbs;
+    uint32_t *source_index;
+    uint64_t entries;
+    uint64_t dependency_refusals;
+    uint64_t dependency_invalidations;
+    uint64_t internal_edges;
+    uint64_t search_hits;
+    char *stats_path;
+} sc7;
+
+static void sc7_runtime_reset(void);
+
+static uint32_t sc7_source_index(uint64_t tb_offset)
+{
+    for (uint32_t i = 0; i < supercache.entry_count; i++) {
+        if (supercache.entries[i].record.tb_offset == tb_offset) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static G_NORETURN G_GNUC_PRINTF(1, 2) void sc7_die(const char *fmt, ...)
+{
+    va_list ap;
+    g_autofree char *reason = NULL;
+
+    va_start(ap, fmt);
+    reason = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    error_report("supercache: invalid v7 firmware regions: %s", reason);
+    exit(EXIT_FAILURE);
+}
+
+static void sc7_load_ext(void)
+{
+    Sc7DirHeader h;
+    g_autofree uint8_t *table = NULL;
+    uint64_t expected, hash;
+    uint8_t zero[8] = { 0 };
+
+    if (supercache.header.reserved != SC7_FEAT_FIRMWARE_REGIONS) {
+        sc7_die("unknown feature bits 0x%x", supercache.header.reserved);
+    }
+    if (supercache.flat) {
+        sc7_die("firmware regions need normal mode");
+    }
+    if (pread(supercache.fd, &h, sizeof(h), SC7_DIR_OFFSET) != sizeof(h)) {
+        sc7_die("cannot read directory header");
+    }
+    if (memcmp(h.magic, SC7_DIR_MAGIC, 8) || h.ext_version != 1 ||
+        h.header_size != sizeof(h) || h.region_entry_size != sizeof(Sc7RegionEntry) ||
+        memcmp(h.reserved, zero, sizeof(zero))) {
+        sc7_die("bad directory header");
+    }
+    expected = (uint64_t)h.n_regions * sizeof(Sc7RegionEntry) +
+               (uint64_t)h.n_members * sizeof(Sc7MemberEntry) +
+               (uint64_t)h.n_edges * sizeof(Sc7EdgeEntry);
+    if (h.table_size != expected || h.table_offset < supercache.header.prologue_end ||
+        h.max_end != h.table_offset + h.table_size || h.max_end >= supercache.size) {
+        sc7_die("directory bounds/count mismatch");
+    }
+    table = g_malloc(h.table_size ? h.table_size : 1);
+    if (h.table_size && pread(supercache.fd, table, h.table_size,
+                              SUPERCACHE_CODE_OFFSET + h.table_offset) != h.table_size) {
+        sc7_die("cannot read directory table");
+    }
+    hash = hash_bytes(SUPERCACHE_FNV_OFFSET, &h, offsetof(Sc7DirHeader, checksum));
+    hash = hash_bytes(hash, table, h.table_size);
+    if (hash != h.checksum) {
+        sc7_die("directory checksum mismatch");
+    }
+    sc7.regions = g_memdup2(table, h.n_regions * sizeof(Sc7RegionEntry));
+    sc7.members = g_memdup2(table + h.n_regions * sizeof(Sc7RegionEntry),
+                            h.n_members * sizeof(Sc7MemberEntry));
+    sc7.edges = g_memdup2(table + h.n_regions * sizeof(Sc7RegionEntry) +
+                          h.n_members * sizeof(Sc7MemberEntry),
+                          h.n_edges * sizeof(Sc7EdgeEntry));
+    sc7.private_tbs = g_new0(TranslationBlock *, h.n_members + 1);
+    sc7.source_index = g_new(uint32_t, h.n_members + 1);
+    for (uint32_t i = 0; i < h.n_members; i++) {
+        Sc7MemberEntry *m = &sc7.members[i];
+        uint32_t src = sc7_source_index(m->source_tb_offset);
+
+        uint64_t search_size = src == UINT32_MAX ? 0 :
+            supercache.entries[src].record.end_offset -
+            supercache.entries[src].record.tc_offset -
+            supercache.entries[src].record.tc_size;
+
+        if (src == UINT32_MAX || m->region_index >= h.n_regions ||
+            m->tb_offset + sizeof(TranslationBlock) > m->tc_offset ||
+            m->tc_offset + m->tc_size > h.table_offset ||
+            m->search_offset + search_size > h.table_offset) {
+            sc7_die("member %u has invalid source or bounds", i);
+        }
+        sc7.source_index[i] = src;
+    }
+    for (uint32_t i = 0; i < h.n_regions; i++) {
+        Sc7RegionEntry *r = &sc7.regions[i];
+
+        if (r->first_member + r->n_members > h.n_members ||
+            r->first_edge + r->n_edges > h.n_edges ||
+            r->entry_member >= r->n_members ||
+            sc7_source_index(r->source_tb_offset) == UINT32_MAX ||
+            r->end_offset > h.table_offset || r->start_offset >= r->end_offset) {
+            sc7_die("region %u has invalid slices", i);
+        }
+    }
+    for (uint32_t i = 0; i < h.n_edges; i++) {
+        Sc7EdgeEntry *e = &sc7.edges[i];
+
+        if (e->region_index >= h.n_regions || e->source_member >= h.n_members ||
+            e->target_member >= h.n_members || e->reserved) {
+            sc7_die("edge %u has invalid member", i);
+        }
+    }
+    sc7.header = h;
+    sc7.loaded = true;
+    supercache.max_end = MAX(supercache.max_end, h.max_end);
+}
+
+static void sc7_verify_hashes(void)
+{
+    uint8_t *buf = supercache.buffer;
+
+    for (uint32_t i = 0; i < sc7.header.n_members; i++) {
+        Sc7MemberEntry *m = &sc7.members[i];
+        SupercacheRecord *s = &supercache.entries[sc7.source_index[i]].record;
+        uint64_t search_size = s->end_offset - s->tc_offset - s->tc_size;
+
+        if (hash_bytes(SUPERCACHE_FNV_OFFSET, buf + m->tc_offset, m->tc_size) !=
+                m->code_fnv64 ||
+            hash_bytes(SUPERCACHE_FNV_OFFSET, buf + m->search_offset, search_size) !=
+                m->search_fnv64) {
+            sc7_die("member %u code/search hash mismatch", i);
+        }
+    }
+}
+
+static void sc7_write_stats(void)
+{
+    g_autoptr(GString) j = g_string_new("{\n");
+
+    g_string_append(j, "  \"schema\": \"qemu-sc-v7-stats@1\",\n");
+    g_string_append_printf(j, "  \"loaded\": %s,\n",
+                           sc7.loaded ? "true" : "false");
+    g_string_append_printf(j, "  \"file_version\": %" PRIu32 ",\n",
+                           supercache.loaded_header.version);
+    g_string_append(j, "  \"artifact_id8\": \"");
+    for (int i = 0; i < 8; i++) {
+        g_string_append_printf(j, "%02x", sc7.header.artifact_id8[i]);
+    }
+    g_string_append(j, "\",\n");
+    g_string_append_printf(j,
+        "  \"regions_loaded\": %" PRIu32 ",\n"
+        "  \"members_loaded\": %" PRIu32 ",\n"
+        "  \"region_entries\": %" PRIu64 ",\n"
+        "  \"internal_edges_admitted\": %" PRIu64 ",\n"
+        "  \"dependency_refusals\": %" PRIu64 ",\n"
+        "  \"dependency_invalidations\": %" PRIu64 ",\n"
+        "  \"search_data_hits\": %" PRIu64 "\n}\n",
+        sc7.loaded ? sc7.header.n_regions : 0,
+        sc7.loaded ? sc7.header.n_members : 0,
+        sc7.entries, sc7.internal_edges, sc7.dependency_refusals,
+        sc7.dependency_invalidations, sc7.search_hits);
+    if (!g_file_set_contents(sc7.stats_path, j->str, j->len, NULL)) {
+        warn_report("supercache: cannot write QEMU_SC_V7_STATS file '%s'",
+                    sc7.stats_path);
+    }
+}
+
+static void sc7_configure_from_env(void)
+{
+    const char *path = getenv("QEMU_SC_V7_STATS");
+
+    if (!path || !*path) {
+        return;
+    }
+    if (!g_path_is_absolute(path)) {
+        error_report("supercache: QEMU_SC_V7_STATS must be an absolute path");
+        exit(EXIT_FAILURE);
+    }
+    sc7.stats_path = g_strdup(path);
+    atexit(sc7_write_stats);
+}
 
 static G_NORETURN G_GNUC_PRINTF(1, 2) void sc6_die(const char *fmt, ...)
 {
@@ -1693,9 +1956,10 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
             reuse = true;
             supercache.header = disk_header;
         } else if (memcmp(disk_header.magic, SUPERCACHE_MAGIC, 8) == 0 &&
-                   disk_header.version == SC6_VERSION) {
-            /* Q1: the stock path below truncates; say so for v6 files. */
-            warn_report("supercache: discarding v6 file: %s",
+                   (disk_header.version == SC6_VERSION ||
+                    disk_header.version == SC7_VERSION)) {
+            /* The stock path below truncates; say so for extension files. */
+            warn_report("supercache: discarding v%u file: %s", disk_header.version,
                         header_problem(&disk_header, size, signature));
         }
     }
@@ -1731,6 +1995,8 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
         flat_index_init();
         if (supercache.header.version == SC6_VERSION) {
             sc6_load_ext();                         /* Q2, Q3, Q4 */
+        } else if (supercache.header.version == SC7_VERSION) {
+            sc7_load_ext();
         }
         supercache.loaded_max_end = supercache.max_end;
         supercache.loaded_header = disk_header;
@@ -1779,6 +2045,9 @@ void tcg_supercache_after_prologue(TCGContext *s)
         if (sc6.loaded) {
             sc6_verify_hashes();                    /* Q4 */
         }
+        if (sc7.loaded) {
+            sc7_verify_hashes();
+        }
         qatomic_set(&s->code_gen_ptr,
                     (uint8_t *)supercache.buffer + supercache.max_end);
     }
@@ -1810,6 +2079,7 @@ void tcg_supercache_runtime_reset(void)
             supercache.entries[i].invalid = false;
         }
         sc6_runtime_reset();                        /* Q6 */
+        sc7_runtime_reset();
     }
 }
 
@@ -1830,6 +2100,188 @@ static uint64_t guest_hash(tb_page_addr_t page0, tb_page_addr_t page1,
         hash = hash_bytes(hash, p, size - first);
     }
     return hash;
+}
+
+static bool sc7_member_internal_slot(uint32_t member, uint16_t field)
+{
+    for (uint32_t i = 0; i < sc7.header.n_edges; i++) {
+        if (sc7.edges[i].source_member == member &&
+            sc7.edges[i].field_offset == field) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static TranslationBlock *sc7_build_member(CPUState *cpu, uint32_t index)
+{
+    Sc7MemberEntry *m = &sc7.members[index];
+    SupercacheRecord *r = &supercache.entries[sc7.source_index[index]].record;
+    TranslationBlock *tb = (TranslationBlock *)
+        ((uint8_t *)supercache.buffer + m->tb_offset);
+
+    memset(tb, 0, sizeof(*tb));
+    tb->pc = r->pc;
+    tb->cs_base = r->cs_base;
+    tb->flags = r->flags;
+    tb->cflags = r->cflags;
+    tb->size = r->guest_size;
+    tb->icount = r->icount;
+    tb->tc.ptr = (uint8_t *)supercache.buffer + m->tc_offset;
+    tb->tc.size = m->tc_size;
+    tb_set_page_addr0(tb, r->page_addr0);
+    tb_set_page_addr1(tb, r->page_addr1);
+    tb_supercache_protect_code(r->page_addr0);
+    if (r->page_addr1 != UINT64_MAX) {
+        tb_supercache_protect_code(r->page_addr1);
+    }
+    memcpy(tb->jmp_reset_offset, r->jmp_reset_offset,
+           sizeof(tb->jmp_reset_offset));
+    memcpy(tb->jmp_insn_offset, r->jmp_insn_offset,
+           sizeof(tb->jmp_insn_offset));
+    qemu_spin_init(&tb->jmp_lock);
+    qemu_thread_jit_write();
+    for (int n = 0; n < 2; n++) {
+        if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID &&
+            !sc7_member_internal_slot(index, tb->jmp_insn_offset[n])) {
+            tb_reset_jump(tb, n);
+        }
+    }
+    qemu_thread_jit_execute();
+    qemu_plugin_supercache_rehydrate(cpu, tb, m->guest_vaddr, false);
+    flush_idcache_range((uintptr_t)tb->tc.ptr, (uintptr_t)tb->tc.ptr,
+                        tb->tc.size);
+    tcg_tb_insert(tb);
+    sc7.private_tbs[index] = tb;
+    return tb;
+}
+
+static TranslationBlock *sc7_try_region(CPUState *cpu, uint32_t source)
+{
+    if (!sc7.loaded || cpu->singlestep_enabled ||
+        !QTAILQ_EMPTY(&cpu->breakpoints) || !QTAILQ_EMPTY(&cpu->watchpoints)) {
+        return NULL;
+    }
+    for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
+        Sc7RegionEntry *region = &sc7.regions[ri];
+
+        if (sc7_source_index(region->source_tb_offset) != source) {
+            continue;
+        }
+        for (uint32_t n = 0; n < region->n_members; n++) {
+            uint32_t mi = region->first_member + n;
+            SupercacheEntry *dep = &supercache.entries[sc7.source_index[mi]];
+            SupercacheRecord *r = &dep->record;
+
+            if (dep->invalid || guest_hash(r->page_addr0, r->page_addr1,
+                                           r->guest_size) != r->guest_hash) {
+                sc7.dependency_refusals++;
+                return NULL;
+            }
+        }
+        for (uint32_t n = 0; n < region->n_members; n++) {
+            uint32_t mi = region->first_member + n;
+
+            if (!sc7.private_tbs[mi]) {
+                sc7_build_member(cpu, mi);
+            }
+        }
+        sc7.entries++;
+        sc7.internal_edges += region->n_edges;
+        return sc7.private_tbs[region->first_member + region->entry_member];
+    }
+    return NULL;
+}
+
+static void sc7_runtime_reset(void)
+{
+    if (sc7.loaded) {
+        memset(sc7.private_tbs, 0,
+               sizeof(*sc7.private_tbs) * (sc7.header.n_members + 1));
+    }
+}
+
+const uint8_t *tcg_supercache_search_data(const TranslationBlock *tb)
+{
+    if (!sc7.loaded) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < sc7.header.n_members; i++) {
+        if (sc7.private_tbs[i] == tb) {
+            sc7.search_hits++;
+            return (const uint8_t *)supercache.buffer +
+                   sc7.members[i].search_offset;
+        }
+    }
+    return NULL;
+}
+
+static bool sc7_record_overlaps(const SupercacheRecord *r,
+                                tb_page_addr_t start,
+                                tb_page_addr_t last)
+{
+    uint64_t first = MIN((uint64_t)r->guest_size,
+                         (uint64_t)TARGET_PAGE_SIZE -
+                         (r->page_addr0 & ~TARGET_PAGE_MASK));
+    uint64_t p0_last = r->page_addr0 + first - 1;
+
+    if (r->page_addr0 <= last && p0_last >= start) {
+        return true;
+    }
+    if (first < r->guest_size && r->page_addr1 != UINT64_MAX) {
+        uint64_t p1_last = r->page_addr1 + (r->guest_size - first) - 1;
+
+        return r->page_addr1 <= last && p1_last >= start;
+    }
+    return false;
+}
+
+bool tcg_supercache_code_invalidated(tb_page_addr_t start,
+                                     tb_page_addr_t last,
+                                     TranslationBlock *current_tb)
+{
+    bool current_affected = false;
+
+    if (!sc7.loaded) {
+        return false;
+    }
+    qemu_thread_jit_write();
+    for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
+        Sc7RegionEntry *region = &sc7.regions[ri];
+        bool affected = false;
+
+        for (uint32_t n = 0; n < region->n_members && !affected; n++) {
+            uint32_t mi = region->first_member + n;
+            SupercacheRecord *r =
+                &supercache.entries[sc7.source_index[mi]].record;
+
+            affected = sc7_record_overlaps(r, start, last);
+        }
+        if (!affected) {
+            continue;
+        }
+        for (uint32_t n = 0; n < region->n_members; n++) {
+            uint32_t mi = region->first_member + n;
+            TranslationBlock *tb = sc7.private_tbs[mi];
+
+            if (!tb) {
+                continue;
+            }
+            current_affected |= tb == current_tb;
+            for (int slot = 0; slot < 2; slot++) {
+                if (tb->jmp_reset_offset[slot] != TB_JMP_OFFSET_INVALID &&
+                    !sc7_member_internal_slot(mi,
+                                              tb->jmp_insn_offset[slot])) {
+                    tb_unlink_jump(tb, slot);
+                }
+            }
+            tb_supercache_invalidate_private(tb);
+            sc7.private_tbs[mi] = NULL;
+        }
+        sc7.dependency_invalidations++;
+    }
+    qemu_thread_jit_execute();
+    return current_affected;
 }
 
 void tcg_supercache_record(TranslationBlock *tb, const void *end)
@@ -2132,6 +2584,14 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
                    r->guest_size) != r->guest_hash) {
         return NULL;
     }
+    if (unlikely(sc7.loaded)) {
+        TranslationBlock *private_entry = sc7_try_region(cpu,
+            entry - supercache.entries);
+
+        if (private_entry) {
+            return private_entry;
+        }
+    }
 
     tb->pc = r->pc;
     tb->cs_base = r->cs_base;
@@ -2415,6 +2875,18 @@ TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr)
 }
 
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
+{
+    return false;
+}
+
+const uint8_t *tcg_supercache_search_data(const TranslationBlock *tb)
+{
+    return NULL;
+}
+
+bool tcg_supercache_code_invalidated(tb_page_addr_t start,
+                                     tb_page_addr_t last,
+                                     TranslationBlock *current_tb)
 {
     return false;
 }

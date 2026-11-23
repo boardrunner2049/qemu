@@ -23,6 +23,7 @@
 #include "qemu/plugin.h"
 #include "qemu/log.h"
 #include "tcg/tcg.h"
+#include "tcg/supercache.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg/tcg-op-common.h"
 #include "tcg/insn-start-words.h"
@@ -928,8 +929,12 @@ unsigned qemu_plugin_supercache_rehydrate(CPUState *cpu, TranslationBlock *tb,
     DisasContextBase db = { 0 };
     struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
     uint64_t insn_data[INSN_START_WORDS] = { 0 };
-    const uint8_t *search = tb->tc.ptr + tb->tc.size;
+    const uint8_t *search = tcg_supercache_search_data(tb);
     void *host_pc = NULL;
+
+    if (!search) {
+        search = tb->tc.ptr + tb->tc.size;
+    }
 
     if (!test_bit(QEMU_PLUGIN_EV_VCPU_TB_TRANS,
                   cpu->plugin_state->event_mask)) {
