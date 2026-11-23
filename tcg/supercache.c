@@ -810,8 +810,8 @@ static struct {
 #define SC7_REGION_COMPOSITE      1u
 #define SC7_REGION_TRUSTED        2u
 #define SC7_EDGE_TRUSTED_SKIP_POLL 1u
-#define SC7_TRUSTED_PREFIX_SIZE   15u
-#define SC7_TRUSTED_EDGE_SKIP     11u
+#define SC7_TRUSTED_CAN_DO_IO_OFFSET 11u
+#define SC7_TRUSTED_BODY_OFFSET   15u
 
 typedef struct Sc7DirHeader {
     char magic[8];
@@ -1211,10 +1211,10 @@ static void sc7_verify_hashes(void)
         for (uint32_t i = 0; i < sc7.header.n_members; i++) {
             Sc7MemberEntry *m = &sc7.members[i];
 
-            if (m->tc_size < SC7_TRUSTED_PREFIX_SIZE ||
+            if (m->tc_size <= SC7_TRUSTED_BODY_OFFSET ||
                 memcmp(buf + m->tc_offset,
                        "\x8b\x5d\xf8\x85\xdb\x0f\x8c", 7) ||
-                memcmp(buf + m->tc_offset + SC7_TRUSTED_EDGE_SKIP,
+                memcmp(buf + m->tc_offset + SC7_TRUSTED_CAN_DO_IO_OFFSET,
                        "\xc6\x45\xfc", 3) ||
                 (buf[m->tc_offset + 14] != 0 &&
                  buf[m->tc_offset + 14] != 1)) {
@@ -1227,7 +1227,7 @@ static void sc7_verify_hashes(void)
             Sc7MemberEntry *target = &sc7.members[e->target_member];
             int32_t displacement;
             int64_t next = source->tc_offset + e->field_offset + 4;
-            uint64_t expected = target->tc_offset + SC7_TRUSTED_EDGE_SKIP;
+            uint64_t expected = target->tc_offset + SC7_TRUSTED_BODY_OFFSET;
 
             memcpy(&displacement,
                    buf + source->tc_offset + e->field_offset,
@@ -2491,14 +2491,15 @@ static bool sc7_trusted_region_for_host(uint64_t offset, uint32_t *index)
 {
     for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
         Sc7RegionEntry *r = &sc7.regions[ri];
-        Sc7MemberEntry *first = &sc7.members[r->first_member];
-        Sc7MemberEntry *last =
-            &sc7.members[r->first_member + r->n_members - 1];
 
-        if (offset >= first->tc_offset &&
-            offset < last->tc_offset + last->tc_size) {
-            *index = ri;
-            return true;
+        for (uint32_t n = 0; n < r->n_members; n++) {
+            Sc7MemberEntry *m = &sc7.members[r->first_member + n];
+
+            if (offset >= m->tc_offset + SC7_TRUSTED_BODY_OFFSET &&
+                offset < m->tc_offset + m->tc_size) {
+                *index = ri;
+                return true;
+            }
         }
     }
     return false;
@@ -2600,8 +2601,9 @@ static TranslationBlock *sc7_build_trusted_entry(Sc7RegionEntry *region)
     tb->cflags = r->cflags;
     tb->size = r->guest_size;
     tb->icount = r->icount;
-    tb->tc.ptr = (uint8_t *)supercache.buffer + first->tc_offset;
-    tb->tc.size = code_end - first->tc_offset;
+    tb->tc.ptr = (uint8_t *)supercache.buffer + first->tc_offset +
+                 SC7_TRUSTED_BODY_OFFSET;
+    tb->tc.size = code_end - first->tc_offset - SC7_TRUSTED_BODY_OFFSET;
     tb_set_page_addr0(tb, r->page_addr0);
     tb_set_page_addr1(tb, r->page_addr1);
     for (int slot = 0; slot < 2; slot++) {
