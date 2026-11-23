@@ -955,11 +955,17 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 static void scopt_sealed_pretranslate(CPUState *cpu, TCGTBCPUState *context)
 {
     static bool complete;
-    const char *ranges = getenv("QEMU_SCOPT_SEALED_RANGES");
-    const char *trace_path = getenv("QEMU_SCOPT_SEALED_TRACE");
+    static bool configured;
+    static const char *ranges;
+    static const char *trace_path;
     g_auto(GStrv) parts = NULL;
     FILE *trace;
 
+    if (unlikely(!configured)) {
+        ranges = getenv("QEMU_SCOPT_SEALED_RANGES");
+        trace_path = getenv("QEMU_SCOPT_SEALED_TRACE");
+        configured = true;
+    }
     if (ranges || trace_path || tcg_supercache_sealed()) {
         /* Exact guest-PC keys make the sealed direct-entry array possible.
          * This is an existing QEMU translation mode, scoped to the explicit

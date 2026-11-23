@@ -123,6 +123,7 @@ static struct {
     bool initialized;
     bool flat;
     bool sealed;
+    bool sealed_skip_irq;
     bool exact_pc;
 } supercache = {
     .fd = -1,
@@ -337,6 +338,7 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads)
 {
     const char *sealed = getenv("QEMU_SC_SEALED");
+    const char *sealed_skip_irq = getenv("QEMU_SC_SEALED_SKIP_IRQ");
 
     if (!path) {
         /* Let capture/profile reject their switch without a supercache. */
@@ -359,7 +361,16 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
         error_report("QEMU_SC_SEALED must be exactly 1 when set");
         exit(EXIT_FAILURE);
     }
+    if (sealed_skip_irq && strcmp(sealed_skip_irq, "1")) {
+        error_report("QEMU_SC_SEALED_SKIP_IRQ must be exactly 1 when set");
+        exit(EXIT_FAILURE);
+    }
+    if (sealed_skip_irq && !sealed) {
+        error_report("QEMU_SC_SEALED_SKIP_IRQ requires QEMU_SC_SEALED=1");
+        exit(EXIT_FAILURE);
+    }
     supercache.sealed = sealed != NULL;
+    supercache.sealed_skip_irq = sealed_skip_irq != NULL;
     supercache.exact_pc = supercache.sealed || getenv("QEMU_SCOPT_SEALED_RANGES");
     sc6_configure_from_env();
     sc7_configure_from_env();
@@ -3419,6 +3430,7 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     if (supercache.sealed) {
         uint8_t *code = (uint8_t *)supercache.buffer + r->tc_offset;
         uint32_t limit = MIN(r->tc_size, 64u);
+        bool body_boundary = false;
 
         if (r->cflags & CF_USE_ICOUNT ||
             r->tc_size <= SC7_TRUSTED_BODY_OFFSET ||
@@ -3437,16 +3449,26 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
              off + 4 <= limit; off++) {
             if (!memcmp(code + off, "\xc6\x45\xfc", 3) &&
                 (code[off + 3] == 0 || code[off + 3] == 1)) {
-                qemu_thread_jit_write();
-                code[off + 3] = 1;
-                trusted_body = SC7_TRUSTED_CAN_DO_IO_OFFSET;
+                body_boundary = true;
                 break;
             }
         }
-        if (!trusted_body) {
+        if (!body_boundary) {
             error_report("sealed supercache TB at pc=0x%" PRIx64
                          " has no verified body boundary", r->pc);
             exit(EXIT_FAILURE);
+        }
+        if (supercache.sealed_skip_irq) {
+            /* Keep the native entry address aligned for incoming chains.
+             * Encode the 11-byte poll as two architectural NOPs rather than
+             * eleven one-byte NOPs, which add excessive decode work. */
+            static const uint8_t nop11[] = {
+                0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x66, 0x90,
+            };
+
+            qemu_thread_jit_write();
+            memcpy(code, nop11, sizeof(nop11));
         }
     }
     tb->tc.ptr = (uint8_t *)supercache.buffer + r->tc_offset + trusted_body;
@@ -3497,7 +3519,21 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     flush_idcache_range((uintptr_t)tb->tc.ptr,
                         (uintptr_t)tb->tc.ptr, tb->tc.size);
     entry->used = true;
-    if (supercache.flat || supercache.sealed) {
+    if (supercache.flat) {
+        return tb;
+    }
+
+    if (supercache.sealed) {
+        /* Publish the checked exact key into QEMU's fast guest-key table,
+         * code-page lists, and host-address index.  The latter is also used
+         * by plugin attribution; cpu_io_recompile separately rejects sealed
+         * recovery, so indexing does not weaken the no-recovery contract. */
+        tcg_tb_insert(tb);
+        linked = tb_supercache_link(tb);
+        if (linked != tb) {
+            tcg_tb_remove(tb);
+            return linked;
+        }
         return tb;
     }
 

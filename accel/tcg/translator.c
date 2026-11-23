@@ -214,7 +214,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     } else {
         tcg_debug_assert(first_insn_start != db->insn_start);
         tcg_ctx->emit_before_op = first_insn_start;
-        translator_set_can_do_io(false);
+        /* A sealed producer deliberately has no in-QEMU fault/MMIO rewind.
+         * Encode that contract in captured hot TBs instead of mutating every
+         * executable page when the cache is loaded. */
+        translator_set_can_do_io(getenv("QEMU_SCOPT_SEALED_RANGES") != NULL);
     }
     tcg_ctx->emit_before_op = db->insn_start;
     translator_set_can_do_io(true);

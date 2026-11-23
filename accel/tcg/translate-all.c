@@ -594,6 +594,10 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     CPUClass *cc;
     uint32_t n;
 
+    if (tcg_supercache_sealed()) {
+        cpu_abort(cpu, "sealed supercache forbids in-QEMU I/O recovery at pc=%p",
+                  (void *)retaddr);
+    }
     tb = tcg_tb_lookup(retaddr);
     if (!tb) {
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
