@@ -1007,7 +1007,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * See if we can patch the calling TB.  Profile mode (scp) never
              * chains, so that every TB entry is observed.
              */
-            if (last_tb && likely(!scp_active)) {
+            if (last_tb && likely(!scp_active) &&
+                !tcg_supercache_trusted_tb(last_tb) &&
+                !tcg_supercache_trusted_tb(tb)) {
                 tb_add_jump(last_tb, tb_exit, tb);
             }
             if (unlikely(scp_active)) {
