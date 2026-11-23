@@ -41,6 +41,10 @@
 #include "exec/icount.h"
 #include "exec/replay-core.h"
 #include "system/tcg.h"
+#ifndef CONFIG_USER_ONLY
+#include "system/address-spaces.h"
+#include "system/memory.h"
+#endif
 #include "exec/helper-proto-common.h"
 #include "tb-jmp-cache.h"
 #include "tb-hash.h"
@@ -392,7 +396,7 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     cpu->neg.can_do_io = true;
 
     TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
-    s.cflags = curr_cflags(cpu);
+    s.cflags = tcg_supercache_normalize_cflags(curr_cflags(cpu));
 
     if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
         cpu_loop_exit(cpu);
@@ -580,7 +584,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
         cpu->running = true;
 
         TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
-        s.cflags = curr_cflags(cpu);
+        s.cflags = tcg_supercache_normalize_cflags(curr_cflags(cpu));
 
         /* Execute in a serial context. */
         s.cflags &= ~CF_PARALLEL;
@@ -940,6 +944,115 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 #endif
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * Whole-firmware sealed-cache producer.  The caller supplies immutable ROM
+ * ranges as START-END pairs.  At the first ordinary reset-context dispatch,
+ * generate a canonical one-instruction TB for every Thumb halfword without
+ * executing it.  CF_SCOPT_ONE_INSN is removed by tb_gen_code before forming
+ * the TB key, so replay looks these entries up with the normal cflags.
+ */
+static void scopt_sealed_pretranslate(CPUState *cpu, TCGTBCPUState *context)
+{
+    static bool complete;
+    const char *ranges = getenv("QEMU_SCOPT_SEALED_RANGES");
+    const char *trace_path = getenv("QEMU_SCOPT_SEALED_TRACE");
+    g_auto(GStrv) parts = NULL;
+    FILE *trace;
+
+    if (ranges || trace_path || tcg_supercache_sealed()) {
+        /* Exact guest-PC keys make the sealed direct-entry array possible.
+         * This is an existing QEMU translation mode, scoped to the explicit
+         * producer/replay contract. */
+        context->cflags &= ~CF_PCREL;
+    }
+    if (complete || (!ranges && !trace_path)) {
+        complete = true;
+        return;
+    }
+    if (ranges && *ranges && trace_path && *trace_path &&
+        tcg_supercache_loaded_max_end() && !access(trace_path, F_OK)) {
+        complete = true;
+        return;
+    }
+    if (!ranges || !*ranges || !trace_path || !*trace_path ||
+        cpu->cpu_index != 0 || (context->cflags & CF_COUNT_MASK) ||
+        !tcg_supercache_enabled() || tcg_supercache_loaded_max_end()) {
+        error_report("invalid sealed supercache producer configuration");
+        exit(EXIT_FAILURE);
+    }
+    trace = fopen(trace_path, "wx");
+    if (!trace) {
+        error_report("cannot create sealed coverage trace: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    parts = g_strsplit(ranges, ",", -1);
+    fprintf(trace, "scopt-sealed-coverage-v1 %" PRIx32 " %" PRIx64
+            " %" PRIx32 "\n", context->flags, (uint64_t)context->cs_base,
+            context->cflags);
+    for (char **part = parts; *part; part++) {
+        unsigned long long start, end;
+        char extra;
+
+        if (sscanf(*part, "%llx-%llx%c", &start, &end, &extra) != 2 ||
+            start >= end || end > UINT32_MAX || ((start | end) & 1)) {
+            error_report("invalid sealed ROM range '%s'", *part);
+            exit(EXIT_FAILURE);
+        }
+        fprintf(trace, "range %llx %llx\n", start, end);
+        for (vaddr pc = start; pc < end; pc += 2) {
+            TCGTBCPUState query = *context;
+            TranslationBlock *tb;
+            hwaddr offset, length = 2;
+            MemoryRegion *mr = address_space_translate(&address_space_memory,
+                                                        pc, &offset, &length,
+                                                        false,
+                                                        MEMTXATTRS_UNSPECIFIED);
+
+            if (!memory_region_is_rom(mr) || length != 2) {
+                error_report("sealed entry 0x%" VADDR_PRIx
+                             " is not immutable mapped ROM", pc);
+                exit(EXIT_FAILURE);
+            }
+            query.pc = pc;
+            tb = tb_lookup(cpu, query);
+            if (!tb) {
+                query.cflags |= CF_SCOPT_ONE_INSN;
+                mmap_lock();
+                tb = tb_gen_code(cpu, query);
+                mmap_unlock();
+            }
+            if (tb->pc != pc || tb->cflags != context->cflags ||
+                tb->flags != context->flags || tb->cs_base != context->cs_base ||
+                tb_page_addr0(tb) == (tb_page_addr_t)-1) {
+                error_report("sealed producer retained the wrong TB key at 0x%"
+                             VADDR_PRIx, pc);
+                exit(EXIT_FAILURE);
+            }
+            fprintf(trace, "tb %" PRIx64 " %" PRIx64 " %" PRIx64
+                    " %" PRIx32 " %" PRIx64 " %" PRIx32 " %u %u\n",
+                    (uint64_t)pc, (uint64_t)tb_page_addr0(tb),
+                    (uint64_t)tb_page_addr1(tb), tb->flags,
+                    (uint64_t)tb->cs_base, tb->cflags, tb->size, tb->icount);
+            /* Persist exhaustive coverage, then retire this deliberately
+             * tiny producer TB from the live lookup tables.  The workload
+             * that follows can therefore capture its ordinary multi-insn
+             * hot TBs under the same key.  On sealed replay the newest hot
+             * duplicate wins, while the exhaustive one-insn record remains
+             * the fail-closed fallback for every other declared entry. */
+            mmap_lock();
+            tb_phys_invalidate(tb, -1);
+            mmap_unlock();
+        }
+    }
+    if (fprintf(trace, "end\n") < 0 || fclose(trace)) {
+        error_report("cannot finalize sealed coverage trace");
+        exit(EXIT_FAILURE);
+    }
+    complete = true;
+}
+#endif
+
 /* main execution loop */
 
 static int __attribute__((noinline))
@@ -965,10 +1078,15 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * does not require tcg headers for cpu_common_reset.
              */
             if (s.cflags == -1) {
-                s.cflags = curr_cflags(cpu);
+                s.cflags = tcg_supercache_normalize_cflags(curr_cflags(cpu));
             } else {
                 cpu->cflags_next_tb = -1;
+                s.cflags = tcg_supercache_normalize_cflags(s.cflags);
             }
+
+#ifndef CONFIG_USER_ONLY
+            scopt_sealed_pretranslate(cpu, &s);
+#endif
 
             if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
                 break;
@@ -1021,6 +1139,14 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+
+            /* A trusted composite has no descriptor for the particular
+             * member whose residual exit returned here.  Its admitted
+             * internal edges are already linked, so suppress the otherwise
+             * repeated generic-chain attempt for this residual exit. */
+            if (last_tb && tcg_supercache_trusted_tb(last_tb)) {
+                last_tb = NULL;
+            }
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */

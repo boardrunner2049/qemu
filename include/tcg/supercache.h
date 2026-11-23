@@ -12,6 +12,8 @@ typedef struct TCGContext TCGContext;
 void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads);
 bool tcg_supercache_enabled(void);
+bool tcg_supercache_sealed(void);
+uint32_t tcg_supercache_normalize_cflags(uint32_t cflags);
 void *tcg_supercache_buffer(void);
 uint64_t tcg_supercache_loaded_max_end(void);
 int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
@@ -58,6 +60,16 @@ static inline void tcg_supercache_configure(const char *path, bool flat,
 static inline bool tcg_supercache_enabled(void)
 {
     return false;
+}
+
+static inline bool tcg_supercache_sealed(void)
+{
+    return false;
+}
+
+static inline uint32_t tcg_supercache_normalize_cflags(uint32_t cflags)
+{
+    return cflags;
 }
 
 static inline void *tcg_supercache_buffer(void)

@@ -88,6 +88,7 @@ typedef struct SupercacheKey {
 typedef struct SupercacheEntry {
     SupercacheRecord record;
     uint32_t next;
+    uint32_t flat_next;
     bool used;
     bool invalid;
 } SupercacheEntry;
@@ -121,6 +122,8 @@ static struct {
     bool configured;
     bool initialized;
     bool flat;
+    bool sealed;
+    bool exact_pc;
 } supercache = {
     .fd = -1,
 };
@@ -333,6 +336,8 @@ bool tcg_supercache_flat_requested(void)
 void tcg_supercache_configure(const char *path, bool flat, int splitwx,
                               unsigned max_threads)
 {
+    const char *sealed = getenv("QEMU_SC_SEALED");
+
     if (!path) {
         /* Let capture/profile reject their switch without a supercache. */
         scc_configure_from_env();
@@ -350,6 +355,12 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
     supercache.path = g_canonicalize_filename(path, NULL);
     supercache.configured = true;
     supercache.flat = flat;
+    if (sealed && strcmp(sealed, "1")) {
+        error_report("QEMU_SC_SEALED must be exactly 1 when set");
+        exit(EXIT_FAILURE);
+    }
+    supercache.sealed = sealed != NULL;
+    supercache.exact_pc = supercache.sealed || getenv("QEMU_SCOPT_SEALED_RANGES");
     sc6_configure_from_env();
     sc7_configure_from_env();
     scc_configure_from_env();
@@ -359,6 +370,16 @@ void tcg_supercache_configure(const char *path, bool flat, int splitwx,
 bool tcg_supercache_enabled(void)
 {
     return supercache.configured;
+}
+
+bool tcg_supercache_sealed(void)
+{
+    return supercache.initialized && supercache.sealed;
+}
+
+uint32_t tcg_supercache_normalize_cflags(uint32_t cflags)
+{
+    return supercache.exact_pc ? cflags & ~CF_PCREL : cflags;
 }
 
 void *tcg_supercache_buffer(void)
@@ -468,7 +489,7 @@ static void flat_index_init(void)
     uint64_t max_pc = 0;
     uint64_t slot_count = 0;
 
-    if (!supercache.flat || !supercache.entry_count) {
+    if ((!supercache.flat && !supercache.sealed) || !supercache.entry_count) {
         return;
     }
     for (uint32_t i = 0; i < supercache.entry_count; i++) {
@@ -498,7 +519,10 @@ static void flat_index_init(void)
             const SupercacheRecord *record = &supercache.entries[i].record;
 
             if (!(record->cflags & CF_PCREL)) {
-                supercache.flat_direct[record->pc - min_pc] = i + 1;
+                uint32_t *head = &supercache.flat_direct[record->pc - min_pc];
+
+                supercache.entries[i].flat_next = *head;
+                *head = i + 1;
             }
         }
         return;
@@ -1239,7 +1263,10 @@ static void sc7_load_ext(void)
             }
         }
     }
-    if (trusted && sc7.experiment_trusted_set) {
+    /* Trusted membership is queried from the generic chaining path.  A
+     * linear region scan here turns every refused chain into O(regions)
+     * work, so the exact set is the canonical representation. */
+    if (trusted) {
         sc7.trusted_tbs = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
     sc7.header = h;
@@ -2417,6 +2444,10 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
     }
 
     supercache.size = size;
+    if (supercache.sealed && !reuse) {
+        error_setg(errp, "sealed supercache requires an existing complete cache");
+        return -1;
+    }
     if (!reuse) {
         if (ftruncate(supercache.fd, code_end) < 0) {
             error_setg_errno(errp, errno, "resize supercache '%s'",
@@ -3343,6 +3374,7 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     SupercacheKey candidate_key = record_key(r);
     TranslationBlock *tb;
     TranslationBlock *linked;
+    uint32_t trusted_body = 0;
 
     if (!key_equal(key, &candidate_key) || entry->invalid) {
         return NULL;
@@ -3357,12 +3389,12 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     }
     tb = (TranslationBlock *)((uint8_t *)supercache.buffer + r->tb_offset);
     if (entry->used) {
-        return supercache.flat ? tb : NULL;
+        return (supercache.flat || supercache.sealed) ? tb : NULL;
     }
-    if (!second_page_matches(cpu, state, r)) {
+    if (!supercache.sealed && !second_page_matches(cpu, state, r)) {
         return NULL;
     }
-    if (!sc7.trusted) {
+    if (!sc7.trusted && !supercache.sealed) {
         sc7.guest_hash_checks += sc7.loaded;
         if (guest_hash(r->page_addr0, r->page_addr1,
                        r->guest_size) != r->guest_hash) {
@@ -3384,14 +3416,60 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     tb->cflags = r->cflags;
     tb->size = r->guest_size;
     tb->icount = r->icount;
-    tb->tc.ptr = (uint8_t *)supercache.buffer + r->tc_offset;
-    tb->tc.size = r->tc_size;
+    if (supercache.sealed) {
+        uint8_t *code = (uint8_t *)supercache.buffer + r->tc_offset;
+        uint32_t limit = MIN(r->tc_size, 64u);
+
+        if (r->cflags & CF_USE_ICOUNT ||
+            r->tc_size <= SC7_TRUSTED_BODY_OFFSET ||
+            memcmp(code, "\x8b\x5d\xf8\x85\xdb\x0f\x8c", 7)) {
+            error_report("sealed supercache TB at pc=0x%" PRIx64
+                         " lacks the trusted entry prefix", r->pc);
+            exit(EXIT_FAILURE);
+        }
+        /* translator_loop() inserts a can_do_io store immediately before the
+         * first guest instruction.  Target-specific TB-start operations may
+         * precede it: for example, ARM clears architectural IT state there.
+         * Verify the boundary, skip only the generic 11-byte IRQ poll, and in
+         * this explicitly unsafe/no-recovery mode force can_do_io=true for a
+         * multi-insn hot TB instead of asking cpu_io_recompile() to rewind it. */
+        for (uint32_t off = SC7_TRUSTED_CAN_DO_IO_OFFSET;
+             off + 4 <= limit; off++) {
+            if (!memcmp(code + off, "\xc6\x45\xfc", 3) &&
+                (code[off + 3] == 0 || code[off + 3] == 1)) {
+                qemu_thread_jit_write();
+                code[off + 3] = 1;
+                trusted_body = SC7_TRUSTED_CAN_DO_IO_OFFSET;
+                break;
+            }
+        }
+        if (!trusted_body) {
+            error_report("sealed supercache TB at pc=0x%" PRIx64
+                         " has no verified body boundary", r->pc);
+            exit(EXIT_FAILURE);
+        }
+    }
+    tb->tc.ptr = (uint8_t *)supercache.buffer + r->tc_offset + trusted_body;
+    tb->tc.size = r->tc_size - trusted_body;
     tb_set_page_addr0(tb, r->page_addr0);
     tb_set_page_addr1(tb, r->page_addr1);
     memcpy(tb->jmp_reset_offset, r->jmp_reset_offset,
            sizeof(tb->jmp_reset_offset));
     memcpy(tb->jmp_insn_offset, r->jmp_insn_offset,
            sizeof(tb->jmp_insn_offset));
+    if (trusted_body) {
+        for (int slot = 0; slot < 2; slot++) {
+            if (tb->jmp_reset_offset[slot] != TB_JMP_OFFSET_INVALID) {
+                if (tb->jmp_reset_offset[slot] < trusted_body ||
+                    tb->jmp_insn_offset[slot] < trusted_body) {
+                    error_report("sealed supercache jump precedes trusted body");
+                    exit(EXIT_FAILURE);
+                }
+                tb->jmp_reset_offset[slot] -= trusted_body;
+                tb->jmp_insn_offset[slot] -= trusted_body;
+            }
+        }
+    }
     qemu_spin_init(&tb->jmp_lock);
     tb->jmp_list_head = 0;
     tb->jmp_list_next[0] = tb->jmp_list_next[1] = 0;
@@ -3419,7 +3497,7 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
     flush_idcache_range((uintptr_t)tb->tc.ptr,
                         (uintptr_t)tb->tc.ptr, tb->tc.size);
     entry->used = true;
-    if (supercache.flat) {
+    if (supercache.flat || supercache.sealed) {
         return tb;
     }
 
@@ -3486,12 +3564,24 @@ TranslationBlock *tcg_supercache_lookup(CPUState *cpu, TCGTBCPUState state,
             }
         }
     }
-    if (flat_link) {
+    for (link = flat_link; link; link = supercache.entries[link - 1].flat_next) {
         tb = lookup_entry(cpu, state, &key,
-                          &supercache.entries[flat_link - 1]);
+                          &supercache.entries[link - 1]);
         if (tb) {
             return tb;
         }
+    }
+
+    /* Sealed mode declares the direct PC index complete for one exact
+     * translation context.  Falling through to the generic hash or JIT
+     * would silently weaken that contract. */
+    if (supercache.sealed) {
+        error_report("sealed supercache miss at pc=0x%" PRIx64
+                     " flags=0x%" PRIx32 " cs_base=0x%" PRIx64
+                     " cflags=0x%" PRIx32,
+                     (uint64_t)state.pc, state.flags,
+                     (uint64_t)state.cs_base, state.cflags);
+        exit(EXIT_FAILURE);
     }
 
     bucket = key_hash(&key) & (supercache.bucket_count - 1);
@@ -3618,7 +3708,7 @@ bool tcg_supercache_chain_allowed(const TranslationBlock *from,
         return false;
     }
     to_trusted = tcg_supercache_trusted_tb(to);
-    if (to_trusted && !sc7.experiment_incoming_chain) {
+    if (to_trusted && !supercache.sealed && !sc7.experiment_incoming_chain) {
         if (sc7.stats_path) {
             sc7.chain_skipped_trusted_destination++;
         }

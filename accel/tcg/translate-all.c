@@ -279,6 +279,14 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     assert_memory_lock();
     qemu_thread_jit_write();
 
+    bool scopt_one_insn = s.cflags & CF_SCOPT_ONE_INSN;
+
+    /* The sealed-cache producer needs a bounded translation at every Thumb
+     * halfword, including bytes that are not reached by the training run.
+     * This flag controls only the translation length.  Clear it before the
+     * TB key and target translator see cflags, so the resulting one-insn TB
+     * is the canonical ordinary-context implementation for that entry. */
+    s.cflags &= ~CF_SCOPT_ONE_INSN;
     phys_pc = get_page_addr_code_hostp(env, s.pc, &host_pc);
 
     if (phys_pc == -1) {
@@ -286,7 +294,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         s.cflags = (s.cflags & ~CF_COUNT_MASK) | 1;
     }
 
-    max_insns = s.cflags & CF_COUNT_MASK;
+    max_insns = scopt_one_insn ? 1 : s.cflags & CF_COUNT_MASK;
     if (max_insns == 0) {
         max_insns = TCG_MAX_INSNS;
     }
