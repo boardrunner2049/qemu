@@ -1168,9 +1168,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * arm drop last_tb, so tb_add_jump never patches an invalid
              * or internal slot.  An armed slot whose destination is
              * another (or the same) trusted region is chained to that
-             * region's +0, keeping its poll.  With QEMU_SC_V7_STATS the
-             * hook also counts dispatcher returns and trusted residual
-             * exits. */
+             * region's +0, keeping its poll, but only when the cache is
+             * loaded sealed (or with incoming-chain), the
+             * no-trusted-to-trusted-chain experiment is off and the
+             * destination's entry poll verified at load; otherwise
+             * tcg_supercache_chain_target refuses the chain.  With
+             * QEMU_SC_V7_STATS the hook also counts dispatcher returns
+             * and trusted residual exits. */
             if (last_tb && tcg_supercache_loop_return(last_tb, tb_exit)) {
                 last_tb = NULL;
             }

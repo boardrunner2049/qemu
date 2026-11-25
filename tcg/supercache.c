@@ -1303,16 +1303,17 @@ static void sc7_load_ext(uint64_t dir_offset, bool composed)
             sc7_die("member %u has invalid source, region, or flags", i);
         }
         r = &sc7.regions[m->region_index];
+        if (i < r->first_member ||
+            i >= (uint64_t)r->first_member + r->n_members) {
+            sc7_die("member %u is outside its declared region", i);
+        }
+        /* Only once the member is known to lie in r do r's flags apply. */
         want_flags = (composed && trusted &&
                       (r->flags & SC7_REGION_MEMBER_DESCRIPTORS)) ?
                      b3_slots[src] : 0;
         if (m->flags != want_flags) {
             sc7_die("member %u skip flags 0x%x != B3 slot mask 0x%x",
                     i, m->flags, want_flags);
-        }
-        if (i < r->first_member ||
-            i >= (uint64_t)r->first_member + r->n_members) {
-            sc7_die("member %u is outside its declared region", i);
         }
         search_size = trusted ? 0 :
                       supercache.entries[src].record.end_offset -
