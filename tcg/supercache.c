@@ -858,8 +858,9 @@ static struct {
  * sc6 extension stays at 0x100 with its arrays ending at or before
  * SC7_COMPOSED_DIR_OFFSET, and the unchanged v7 directory header sits at
  * SC7_COMPOSED_DIR_OFFSET.  The directory must be trusted: safe members
- * reuse the public record's goto_tb offsets, which B3 growth moves.  Bit 30
- * without bit 31 is an unknown feature.
+ * reuse the public record's goto_tb offsets, to which B3 growth adds guard
+ * slots that the pre-B3 member copies do not have.  Bit 30 without bit 31
+ * is an unknown feature.
  */
 #define SC7_FEAT_SC6_FIRMWARE_REGIONS (1u << 30)
 #define SC7_COMPOSED_DIR_OFFSET   0xff00
@@ -876,6 +877,19 @@ static struct {
  * whose goto_tb slots are invalid.
  */
 #define SC7_REGION_MEMBER_DESCRIPTORS 4u
+/*
+ * Member flags (Sc7MemberEntry.flags).  Members copy the pre-B3 bytes of
+ * their source, while a member descriptor takes its goto_tb offsets from
+ * the source's public record, where B3 growth may have registered guard
+ * slots (each one an sc6 slot of that record).  Bit n says record slot n is
+ * such a slot: it is not part of the copy, so it is neither verified as a
+ * residual exit nor armed.  In a composed directory a member of a
+ * SC7_REGION_MEMBER_DESCRIPTORS region must carry exactly the sc6 slot set
+ * of its source; every other member carries 0.  Skipping only ever removes
+ * a chaining opportunity.
+ */
+#define SC7_MEMBER_SKIP_SLOT(n)   (1u << (n))
+#define SC7_MEMBER_SKIP_SLOTS     3u
 #define SC7_EDGE_TRUSTED_SKIP_POLL 1u
 #define SC7_TRUSTED_CAN_DO_IO_OFFSET 11u
 #define SC7_TRUSTED_BODY_OFFSET   15u
@@ -1041,6 +1055,11 @@ static struct {
     uint64_t trusted_residual_exits_chainable;
     uint64_t trusted_residual_exits_unchainable;
     uint64_t trusted_residual_slots_armed;
+    /*
+     * Member skip bits on valid record slots of the descriptors built (per
+     * build, like trusted_residual_slots_armed).
+     */
+    uint64_t trusted_residual_slots_skipped;
     uint64_t chain_allowed_trusted_source;
     uint64_t chain_skipped_trusted_to_trusted;
     char *stats_path;
@@ -1126,6 +1145,7 @@ static void sc7_load_ext(uint64_t dir_offset, bool composed)
     g_autofree uint8_t *table = NULL;
     g_autofree Sc7Span *occupied = NULL;
     g_autofree Sc7Span *region_spans = NULL;
+    g_autofree uint8_t *b3_slots = NULL;
     uint64_t expected, hash;
     uint64_t table_end;
     uint64_t n_occupied, next_occupied = 0;
@@ -1232,16 +1252,31 @@ static void sc7_load_ext(uint64_t dir_offset, bool composed)
             (Sc7Span) { sc6.variants[i].e.tb_offset,
                         sc6.variants[i].e.end_offset };
     }
+    /* B3-registered goto_tb slots per public record (sc6 parsed them). */
+    b3_slots = g_new0(uint8_t, supercache.entry_count + 1);
+    for (uint32_t k = 0; composed && k < sc6.n_slots; k++) {
+        b3_slots[sc6.slots[k].src] |=
+            SC7_MEMBER_SKIP_SLOT(sc6.slots[k].e.slot_n);
+    }
     for (uint32_t i = 0; i < h.n_members; i++) {
         Sc7MemberEntry *m = &sc7.members[i];
         uint32_t src = sc7_source_index(m->source_tb_offset);
         Sc7RegionEntry *r;
         uint64_t descriptor_end, code_end, search_end, search_size;
+        uint32_t want_flags;
 
-        if (src == UINT32_MAX || m->region_index >= h.n_regions || m->flags) {
+        if (src == UINT32_MAX || m->region_index >= h.n_regions ||
+            (m->flags & ~SC7_MEMBER_SKIP_SLOTS)) {
             sc7_die("member %u has invalid source, region, or flags", i);
         }
         r = &sc7.regions[m->region_index];
+        want_flags = (composed && trusted &&
+                      (r->flags & SC7_REGION_MEMBER_DESCRIPTORS)) ?
+                     b3_slots[src] : 0;
+        if (m->flags != want_flags) {
+            sc7_die("member %u skip flags 0x%x != B3 slot mask 0x%x",
+                    i, m->flags, want_flags);
+        }
         if (i < r->first_member ||
             i >= (uint64_t)r->first_member + r->n_members) {
             sc7_die("member %u is outside its declared region", i);
@@ -1416,7 +1451,8 @@ static bool sc7_region_internal_slot(const Sc7RegionEntry *r, uint32_t member,
 
 /*
  * A member descriptor reuses its source record's goto_tb offsets, so every
- * residual (non-internal) slot of the copied member code must still be the
+ * residual slot of the copied member code (neither internal nor flagged
+ * SC7_MEMBER_SKIP_SLOT, a B3 slot the pre-B3 copy lacks) must still be the
  * reset goto_tb that TCG emitted: "e9 00000000" with the reset path right
  * after the rel32, past the 15-byte entry prefix, and the rel32 4-byte
  * aligned so tb_target_set_jmp_target can patch it atomically.  Checked
@@ -1443,6 +1479,7 @@ static void sc7_verify_residual_slots(void)
                 const uint8_t *p;
 
                 if (s->jmp_reset_offset[slot] == TB_JMP_OFFSET_INVALID ||
+                    (m->flags & SC7_MEMBER_SKIP_SLOT(slot)) ||
                     sc7_region_internal_slot(r, mi, f)) {
                     continue;
                 }
@@ -1559,7 +1596,13 @@ static void sc7_verify_hashes(void)
     }
 }
 
-/* QEMU_SC_V7_STATS counter semantics; bump when a counter changes meaning. */
+/*
+ * QEMU_SC_V7_STATS counter semantics; bump when a counter changes meaning.
+ * trusted_residual_slots_skipped, the SC7_MEMBER_SKIP_SLOT bits on valid
+ * record slots of the member descriptors built while arming (0 under
+ * no-trusted-exit-chain and QEMU_SC_SEALED_SKIP_IRQ, and without a trusted
+ * directory), is a new key that changes no counter's meaning.
+ */
 #define SC7_COUNTERS_REVISION 3
 
 static void sc7_write_loop_return_stats(GString *j)
@@ -1580,6 +1623,7 @@ static void sc7_write_loop_return_stats(GString *j)
         "  \"trusted_residual_exits_chainable\": %" PRIu64 ",\n"
         "  \"trusted_residual_exits_unchainable\": %" PRIu64 ",\n"
         "  \"trusted_residual_slots_armed\": %" PRIu64 ",\n"
+        "  \"trusted_residual_slots_skipped\": %" PRIu64 ",\n"
         "  \"chain_allowed_trusted_source\": %" PRIu64 ",\n"
         "  \"chain_skipped_trusted_to_trusted\": %" PRIu64 ",\n",
         SC7_COUNTERS_REVISION,
@@ -1594,6 +1638,7 @@ static void sc7_write_loop_return_stats(GString *j)
         sc7.trusted_residual_exits_chainable,
         sc7.trusted_residual_exits_unchainable,
         sc7.trusted_residual_slots_armed,
+        sc7.trusted_residual_slots_skipped,
         sc7.chain_allowed_trusted_source,
         sc7.chain_skipped_trusted_to_trusted);
     g_string_append(j, "  \"trusted_residual_exit_regions\": [");
@@ -3016,16 +3061,19 @@ static TranslationBlock *sc7_register_entry(uint32_t index)
  * Initialize the descriptor of trusted member @mi with its source record's
  * identity.  Its code starts @body bytes into the member copy: the region
  * entry skips the 15-byte IRQ-poll prefix, member descriptors keep it.
- * With @arm, the residual goto_tb slots (valid in the record and not an
- * admitted internal edge) get the record's offsets rebased to @body, so the
- * dispatcher may chain them.  Internal slots and all slots of an unarmed
- * descriptor stay TB_JMP_OFFSET_INVALID; tcg_supercache_loop_return never
- * lets such an exit reach tb_add_jump.  Returns the number of armed slots.
+ * With @arm, the residual goto_tb slots (valid in the record, not skipped
+ * by the member's SC7_MEMBER_SKIP_SLOT flags and not an admitted internal
+ * edge) get the record's offsets rebased to @body, so the dispatcher may
+ * chain them; skipped slots are counted in *@skipped.  Skipped and internal
+ * slots and all slots of an unarmed descriptor stay TB_JMP_OFFSET_INVALID;
+ * tcg_supercache_loop_return never lets such an exit reach tb_add_jump.
+ * Returns the number of armed slots.
  */
 static unsigned sc7_init_trusted_descriptor(TranslationBlock *tb,
                                             const Sc7RegionEntry *region,
                                             uint32_t mi, uint32_t body,
-                                            uint64_t tc_size, bool arm)
+                                            uint64_t tc_size, bool arm,
+                                            unsigned *skipped)
 {
     const Sc7MemberEntry *m = &sc7.members[mi];
     const SupercacheRecord *r = &supercache.entries[sc7.source_index[mi]].record;
@@ -3047,8 +3095,14 @@ static unsigned sc7_init_trusted_descriptor(TranslationBlock *tb,
 
         tb->jmp_reset_offset[slot] = TB_JMP_OFFSET_INVALID;
         tb->jmp_insn_offset[slot] = TB_JMP_OFFSET_INVALID;
-        if (!arm || r->jmp_reset_offset[slot] == TB_JMP_OFFSET_INVALID ||
-            sc7_region_internal_slot(region, mi, insn)) {
+        if (!arm || r->jmp_reset_offset[slot] == TB_JMP_OFFSET_INVALID) {
+            continue;
+        }
+        if (m->flags & SC7_MEMBER_SKIP_SLOT(slot)) {
+            (*skipped)++;
+            continue;
+        }
+        if (sc7_region_internal_slot(region, mi, insn)) {
             continue;
         }
         /* sc7_verify_residual_slots proved insn > body and the shape. */
@@ -3085,6 +3139,7 @@ static TranslationBlock *sc7_build_trusted_entry(Sc7RegionEntry *region)
     bool arm = member_descriptors && !sc7.experiment_no_trusted_exit_chain &&
                !supercache.sealed_skip_irq;
     unsigned armed;
+    unsigned skipped = 0;
 
     if (sc7.private_tbs[entry]) {
         return sc7.private_tbs[entry];
@@ -3092,14 +3147,16 @@ static TranslationBlock *sc7_build_trusted_entry(Sc7RegionEntry *region)
     armed = sc7_init_trusted_descriptor(tb, region, entry,
                                         SC7_TRUSTED_BODY_OFFSET,
                                         code_end - first->tc_offset -
-                                        SC7_TRUSTED_BODY_OFFSET, arm);
+                                        SC7_TRUSTED_BODY_OFFSET, arm,
+                                        &skipped);
     sc7.member_prepared[entry] = true;
     for (uint32_t n = 1; member_descriptors && n < region->n_members; n++) {
         uint32_t mi = region->first_member + n;
         TranslationBlock *shadow = sc7_member_tb(mi);
 
         armed += sc7_init_trusted_descriptor(shadow, region, mi, 0,
-                                             sc7.members[mi].tc_size, arm);
+                                             sc7.members[mi].tc_size, arm,
+                                             &skipped);
         sc7.member_prepared[mi] = true;
         if (sc7.trusted_tbs) {
             g_hash_table_insert(sc7.trusted_tbs, shadow,
@@ -3122,6 +3179,7 @@ static TranslationBlock *sc7_build_trusted_entry(Sc7RegionEntry *region)
         qemu_thread_jit_execute();
         sc7.trusted_residual_slots_armed += armed;
     }
+    sc7.trusted_residual_slots_skipped += skipped;
     flush_idcache_range((uintptr_t)tb->tc.ptr, (uintptr_t)tb->tc.ptr,
                         tb->tc.size);
     if (!sc7.experiment_no_tree) {
