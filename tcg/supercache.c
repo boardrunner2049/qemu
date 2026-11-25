@@ -853,6 +853,16 @@ static struct {
  * remaining low bits are the SC6_FEAT_* flags and are validated by the v6
  * loader after this top-level marker is removed. */
 #define SC7_FEAT_SC6_EXTENSION    (1u << 31)
+/*
+ * Composed v7 (B3 + firmware regions): with SC7_FEAT_SC6_EXTENSION, the
+ * sc6 extension stays at 0x100 with its arrays ending at or before
+ * SC7_COMPOSED_DIR_OFFSET, and the unchanged v7 directory header sits at
+ * SC7_COMPOSED_DIR_OFFSET.  The directory must be trusted: safe members
+ * reuse the public record's goto_tb offsets, which B3 growth moves.  Bit 30
+ * without bit 31 is an unknown feature.
+ */
+#define SC7_FEAT_SC6_FIRMWARE_REGIONS (1u << 30)
+#define SC7_COMPOSED_DIR_OFFSET   0xff00
 #define SC7_DIR_VERSION_COMPOSITE 2u
 #define SC7_DIR_VERSION_TRUSTED   3u
 #define SC7_REGION_COMPOSITE      1u
@@ -927,6 +937,9 @@ typedef struct Sc7EdgeEntry {
 } Sc7EdgeEntry;
 
 QEMU_BUILD_BUG_ON(sizeof(Sc7DirHeader) != 80);
+QEMU_BUILD_BUG_ON(SC7_COMPOSED_DIR_OFFSET + sizeof(Sc7DirHeader) >
+                  SUPERCACHE_CODE_OFFSET);
+QEMU_BUILD_BUG_ON(SC7_COMPOSED_DIR_OFFSET < SC6_ARRAYS_OFFSET);
 QEMU_BUILD_BUG_ON(sizeof(Sc7RegionEntry) != 64);
 QEMU_BUILD_BUG_ON(sizeof(Sc7MemberEntry) != 80);
 QEMU_BUILD_BUG_ON(sizeof(Sc7EdgeEntry) != 32);
@@ -934,6 +947,8 @@ QEMU_BUILD_BUG_ON(sizeof(Sc7EdgeEntry) != 32);
 static struct {
     bool loaded;
     bool trusted;
+    /* Loaded from SC7_COMPOSED_DIR_OFFSET next to an sc6 extension. */
+    bool composed;
     Sc7DirHeader header;
     Sc7RegionEntry *regions;
     Sc7MemberEntry *members;
@@ -1099,7 +1114,13 @@ static G_NORETURN G_GNUC_PRINTF(1, 2) void sc7_die(const char *fmt, ...)
     exit(EXIT_FAILURE);
 }
 
-static void sc7_load_ext(void)
+/*
+ * Load the v7 directory whose header is at file offset @dir_offset.  The
+ * caller has validated the top-level feature bits.  @composed: an sc6
+ * extension was loaded first (sc6_load_ext), so its variant spans join the
+ * arena disjointness proof and the directory must be trusted.
+ */
+static void sc7_load_ext(uint64_t dir_offset, bool composed)
 {
     Sc7DirHeader h;
     g_autofree uint8_t *table = NULL;
@@ -1113,13 +1134,13 @@ static void sc7_load_ext(void)
     bool trusted;
     uint8_t zero[8] = { 0 };
 
-    if (supercache.header.reserved != SC7_FEAT_FIRMWARE_REGIONS) {
-        sc7_die("unknown feature bits 0x%x", supercache.header.reserved);
-    }
     if (supercache.flat) {
         sc7_die("firmware regions need normal mode");
     }
-    if (pread(supercache.fd, &h, sizeof(h), SC7_DIR_OFFSET) != sizeof(h)) {
+    if (composed && !sc6.loaded) {
+        sc7_die("sc6 composition without a loaded sc6 extension");
+    }
+    if (pread(supercache.fd, &h, sizeof(h), dir_offset) != sizeof(h)) {
         sc7_die("cannot read directory header");
     }
     if (memcmp(h.magic, SC7_DIR_MAGIC, 8) ||
@@ -1130,6 +1151,9 @@ static void sc7_load_ext(void)
         sc7_die("bad directory header");
     }
     trusted = h.ext_version == SC7_DIR_VERSION_TRUSTED;
+    if (composed && !trusted) {
+        sc7_die("sc6 composition requires a trusted directory");
+    }
     expected = (uint64_t)h.n_regions * sizeof(Sc7RegionEntry) +
                (uint64_t)h.n_members * sizeof(Sc7MemberEntry) +
                (uint64_t)h.n_edges * sizeof(Sc7EdgeEntry);
@@ -1193,7 +1217,8 @@ static void sc7_load_ext(void)
     sc7_check_disjoint(region_spans, h.n_regions, "region");
 
     n_occupied = (uint64_t)supercache.entry_count +
-                 (uint64_t)h.n_members * 2 + descriptor_spans + 1;
+                 (uint64_t)h.n_members * 2 + descriptor_spans + 1 +
+                 (composed ? sc6.n_variants : 0);
     occupied = g_new(Sc7Span, n_occupied);
     for (uint32_t i = 0; i < supercache.entry_count; i++) {
         SupercacheRecord *r = &supercache.entries[i].record;
@@ -1201,6 +1226,12 @@ static void sc7_load_ext(void)
         occupied[next_occupied++] = (Sc7Span) { r->tb_offset, r->end_offset };
     }
     occupied[next_occupied++] = (Sc7Span) { h.table_offset, h.max_end };
+    /* B3 variants (C' clones) are arena residents of the sc6 payload. */
+    for (uint32_t i = 0; composed && i < sc6.n_variants; i++) {
+        occupied[next_occupied++] =
+            (Sc7Span) { sc6.variants[i].e.tb_offset,
+                        sc6.variants[i].e.end_offset };
+    }
     for (uint32_t i = 0; i < h.n_members; i++) {
         Sc7MemberEntry *m = &sc7.members[i];
         uint32_t src = sc7_source_index(m->source_tb_offset);
@@ -1363,6 +1394,7 @@ static void sc7_load_ext(void)
     }
     sc7.header = h;
     sc7.trusted = trusted;
+    sc7.composed = composed;
     sc7.loaded = true;
     supercache.max_end = MAX(supercache.max_end, h.max_end);
 }
@@ -1605,6 +1637,8 @@ static void sc7_write_stats(void)
                            supercache.record_checksum_checks);
     g_string_append_printf(j, "  \"mode\": \"%s\",\n",
                            sc7.trusted ? "trusted" : "safe");
+    g_string_append_printf(j, "  \"sc6_composed\": %s,\n",
+                           sc7.composed ? "true" : "false");
     g_string_append_printf(j,
         "  \"experiment\": {\"source_index\": %s, "
         "\"linear_source_scan\": %s, \"trusted_set\": %s, "
@@ -1836,7 +1870,7 @@ static bool sc6_ranges_overlap(uint64_t a0, uint64_t a1,
  * loaded_max_end is set.  Every failure exits.
  * The two code hashes are checked later, after the code pread (Q4).
  */
-static void sc6_load_ext(uint32_t features)
+static void sc6_load_ext(uint32_t features, uint64_t arrays_limit)
 {
     const SupercacheHeader *h = &supercache.header;
     int64_t t0 = g_get_monotonic_time();
@@ -1885,7 +1919,7 @@ static void sc6_load_ext(uint32_t features)
     arrays_size = (uint64_t)x.n_variants * sizeof(Sc6VariantEntry) +
                   (uint64_t)x.n_slots * sizeof(Sc6SlotEntry) +
                   (uint64_t)x.n_links * sizeof(Sc6LinkEntry);
-    if (SC6_ARRAYS_OFFSET + arrays_size > SUPERCACHE_CODE_OFFSET) {
+    if (SC6_ARRAYS_OFFSET + arrays_size > arrays_limit) {
         sc6_die("ext table too large");
     }
     arrays = g_malloc0(arrays_size + 1);
@@ -2712,9 +2746,19 @@ int tcg_supercache_alloc_code_buffer(size_t size, void **buffer,
             uint32_t features = supercache.header.reserved;
 
             if (features & SC7_FEAT_SC6_EXTENSION) {
-                sc6_load_ext(features & ~SC7_FEAT_SC6_EXTENSION);
-            } else if (features & SC7_FEAT_FIRMWARE_REGIONS) {
-                sc7_load_ext();
+                bool regions = features & SC7_FEAT_SC6_FIRMWARE_REGIONS;
+
+                /* sc6 first: the composed directory proves its arena
+                 * disjoint from the sc6 variants too. */
+                sc6_load_ext(features & ~(SC7_FEAT_SC6_EXTENSION |
+                                          SC7_FEAT_SC6_FIRMWARE_REGIONS),
+                             regions ? SC7_COMPOSED_DIR_OFFSET :
+                                       SUPERCACHE_CODE_OFFSET);
+                if (regions) {
+                    sc7_load_ext(SC7_COMPOSED_DIR_OFFSET, true);
+                }
+            } else if (features == SC7_FEAT_FIRMWARE_REGIONS) {
+                sc7_load_ext(SC7_DIR_OFFSET, false);
             } else if (features) {
                 sc7_die("unknown feature bits 0x%x", features);
             }
