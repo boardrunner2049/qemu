@@ -35,8 +35,17 @@ bool tcg_supercache_trusted_tb(const TranslationBlock *tb);
  * trusted residual exits when QEMU_SC_V7_STATS is set.
  */
 bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit);
-bool tcg_supercache_chain_allowed(const TranslationBlock *from,
-                                  const TranslationBlock *to);
+/*
+ * Host address that goto_tb slot of @from may be patched to so that it
+ * enters @to, or 0 to refuse the chain.  Normally @to->tc.ptr.  A trusted
+ * region entry reached from a trusted source is entered at the start of
+ * its entry member copy (tc.ptr - SC7_TRUSTED_BODY_OFFSET), so that the
+ * verified IRQ/exit-request poll runs on every trusted->trusted transfer.
+ */
+uintptr_t tcg_supercache_chain_target(const TranslationBlock *from,
+                                      const TranslationBlock *to);
+/* QEMU_SC_V7_STATS only: a TB returned TB_EXIT_REQUESTED (its entry poll). */
+void tcg_supercache_note_exit_requested(const TranslationBlock *tb);
 void tcg_supercache_note_chain_result(const TranslationBlock *from,
                                       const TranslationBlock *to,
                                       bool installed);
@@ -143,11 +152,16 @@ static inline bool tcg_supercache_loop_return(const TranslationBlock *tb,
     return false;
 }
 
-static inline bool
-tcg_supercache_chain_allowed(const TranslationBlock *from,
-                             const TranslationBlock *to)
+static inline uintptr_t
+tcg_supercache_chain_target(const TranslationBlock *from,
+                            const TranslationBlock *to)
 {
-    return true;
+    return (uintptr_t)to->tc.ptr;
+}
+
+static inline void
+tcg_supercache_note_exit_requested(const TranslationBlock *tb)
+{
 }
 
 static inline void

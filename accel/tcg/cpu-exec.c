@@ -471,6 +471,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     if (unlikely(tcg_sc6_stats_active)) {
         tcg_supercache_v6_note_exit(last_tb, *tb_exit);   /* v6 Q10 */
     }
+    if (unlikely(tcg_sc7_stats_active) && *tb_exit == TB_EXIT_REQUESTED) {
+        tcg_supercache_note_exit_requested(last_tb);
+    }
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
@@ -639,8 +642,15 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
 
+/*
+ * Patch goto_tb slot @n of @tb to @addr, the entry of @tb_next chosen by
+ * tcg_supercache_chain_target: tb_next->tc.ptr, or for a trusted->trusted
+ * chain the start of the destination region's entry member (its poll).
+ * Unlinking never reads @addr: tb_reset_jump points the slot back at
+ * tb->tc.ptr + jmp_reset_offset[n].
+ */
 static inline bool tb_add_jump(TranslationBlock *tb, int n,
-                               TranslationBlock *tb_next)
+                               TranslationBlock *tb_next, uintptr_t addr)
 {
     uintptr_t old;
 
@@ -660,7 +670,7 @@ static inline bool tb_add_jump(TranslationBlock *tb, int n,
     }
 
     /* patch the native jump address */
-    tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
+    tb_set_jmp_target(tb, n, addr);
 
     /* add in TB jmp list */
     tb->jmp_list_next[n] = tb_next->jmp_list_head;
@@ -669,7 +679,7 @@ static inline bool tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 
     qemu_log_mask(CPU_LOG_EXEC, "Linking TBs %p index %d -> %p\n",
-                  tb->tc.ptr, n, tb_next->tc.ptr);
+                  tb->tc.ptr, n, (void *)addr);
     return true;
 
  out_unlock_next:
@@ -1132,12 +1142,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * See if we can patch the calling TB.  Profile mode (scp) never
              * chains, so that every TB entry is observed.
              */
-            if (last_tb && likely(!scp_active) &&
-                tcg_supercache_chain_allowed(last_tb, tb)) {
-                bool installed = tb_add_jump(last_tb, tb_exit, tb);
+            if (last_tb && likely(!scp_active)) {
+                uintptr_t addr = tcg_supercache_chain_target(last_tb, tb);
 
-                if (unlikely(tcg_sc7_stats_active)) {
-                    tcg_supercache_note_chain_result(last_tb, tb, installed);
+                if (addr) {
+                    bool installed = tb_add_jump(last_tb, tb_exit, tb, addr);
+
+                    if (unlikely(tcg_sc7_stats_active)) {
+                        tcg_supercache_note_chain_result(last_tb, tb,
+                                                         installed);
+                    }
                 }
             }
             if (unlikely(scp_active)) {
@@ -1152,8 +1166,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * the cache has per-member descriptors; the legacy shared
              * descriptor, internal slots and the no-trusted-exit-chain
              * arm drop last_tb, so tb_add_jump never patches an invalid
-             * or internal slot.  With QEMU_SC_V7_STATS the hook also
-             * counts dispatcher returns and trusted residual exits. */
+             * or internal slot.  An armed slot whose destination is
+             * another (or the same) trusted region is chained to that
+             * region's +0, keeping its poll.  With QEMU_SC_V7_STATS the
+             * hook also counts dispatcher returns and trusted residual
+             * exits. */
             if (last_tb && tcg_supercache_loop_return(last_tb, tb_exit)) {
                 last_tb = NULL;
             }

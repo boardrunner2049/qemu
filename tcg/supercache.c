@@ -969,6 +969,12 @@ static struct {
     Sc7EdgeEntry *edges;
     bool *region_admitted;
     bool *member_prepared;
+    /*
+     * Trusted only: sc7_verify_poll_entries proved that the entry member's
+     * IRQ-poll exit names the region's entry descriptor, so the region may
+     * be entered at +0 by a trusted->trusted chain.
+     */
+    bool *region_poll_entry_ok;
     TranslationBlock **private_tbs;
     uint32_t *source_index;
     uint32_t *source_region;
@@ -982,6 +988,12 @@ static struct {
     bool experiment_no_regions;
     /* Build member descriptors unarmed: residual exits stay unchained. */
     bool experiment_no_trusted_exit_chain;
+    /*
+     * Refuse trusted->trusted chains, as in counters revision 3, while every
+     * other chain (trusted->ordinary included) is unchanged.  A/B only: the
+     * same cache bytes with and without chains into region entries at +0.
+     */
+    bool experiment_no_trusted_to_trusted_chain;
     /*
      * Sealed lookups skip sc6_on_activate, as before sealed B3 support: no
      * SPEC link arms and no variant is built, while GENERAL slots still
@@ -1056,12 +1068,32 @@ static struct {
     uint64_t trusted_residual_exits_unchainable;
     uint64_t trusted_residual_slots_armed;
     /*
-     * Member skip bits on valid record slots of the descriptors built (per
-     * build, like trusted_residual_slots_armed).
+     * counters_revision 4: member skip bits on valid record slots of the
+     * descriptors built (per build, like trusted_residual_slots_armed).
      */
     uint64_t trusted_residual_slots_skipped;
     uint64_t chain_allowed_trusted_source;
     uint64_t chain_skipped_trusted_to_trusted;
+    /*
+     * Trusted->trusted chains (counters_revision 4).  A chainable exit whose
+     * destination is a trusted region entry is patched to that region's +0,
+     * so the destination's verified poll runs on every chained transfer.
+     * chain_skipped_trusted_to_trusted now counts only the refused ones:
+     * the no-trusted-to-trusted-chain token, a non-sealed loader without
+     * incoming-chain (chain_skipped_trusted_unsealed, the same rule as an
+     * ordinary->trusted chain), or a destination whose entry prefix did not
+     * verify (chain_skipped_trusted_poll_unverified).
+     * trusted_poll_entry_exits counts TB_EXIT_REQUESTED returns naming a
+     * trusted descriptor: only a +0 entry can produce one.
+     */
+    uint64_t chain_allowed_trusted_to_trusted;
+    uint64_t chain_installs_trusted_to_trusted;
+    uint64_t chain_installs_trusted_self;
+    uint64_t chain_skipped_trusted_poll_unverified;
+    uint64_t trusted_poll_entries_verified;
+    uint64_t trusted_poll_entries_unverified;
+    uint64_t chain_skipped_trusted_unsealed;
+    uint64_t trusted_poll_entry_exits;
     char *stats_path;
 } sc7;
 
@@ -1202,6 +1234,7 @@ static void sc7_load_ext(uint64_t dir_offset, bool composed)
                           h.n_members * sizeof(Sc7MemberEntry),
                           h.n_edges * sizeof(Sc7EdgeEntry));
     sc7.region_admitted = g_new0(bool, h.n_regions + 1);
+    sc7.region_poll_entry_ok = g_new0(bool, h.n_regions + 1);
     sc7.member_prepared = g_new0(bool, h.n_members + 1);
     sc7.private_tbs = g_new0(TranslationBlock *, h.n_members + 1);
     sc7.source_index = g_new(uint32_t, h.n_members + 1);
@@ -1496,6 +1529,78 @@ static void sc7_verify_residual_slots(void)
     }
 }
 
+/*
+ * Trusted only.  A trusted->trusted chain enters the destination region at
+ * +0 (tcg_supercache_chain_target), the first time anything executes the
+ * entry member's IRQ/exit-request poll: dispatcher entries, incoming
+ * public chains, goto_ptr and internal edges all start at +15.  Prove, per
+ * region, the exit that poll takes: the "jl rel32" of the verified prefix
+ * lands inside the entry member's own copy on TCG's exit_tb stub,
+ *     lea rax,[rip+d32] (48 8d 05) or movabs rax,imm64 (48 b8)
+ *     jmp rel32 (e9) to tcg_target_tb_ret_addr()
+ * whose value is the region's entry descriptor | TB_EXIT_REQUESTED, the
+ * descriptor that sc7_build_trusted_entry initializes from the region's
+ * source record.  cpu_tb_exec then restores the guest PC from that
+ * descriptor (synchronize_from_tb) and nothing of the region has run.
+ * When the poll does not fire, +0 also runs the prefix's can_do_io store,
+ * which every other entry skips (they inherit can_do_io = true from
+ * cpu_tb_exec, helper_lookup_tb_ptr or the previous TB's last insn).
+ * sc7_verify_hashes accepts a stored 0 (a capture without
+ * QEMU_SCOPT_SEALED_RANGES); entering such a member at +0 would run it
+ * with can_do_io = false and send an MMIO access before its last insn to
+ * cpu_io_recompile, fatal for trusted code.  So also require the store
+ * to write 1, making a +0 entry equal to a +15 entry plus the poll.
+ * scopt binds every EXIT_TB result to its member descriptor
+ * (retarget_private_descriptor_refs, checked by validate V4), but member
+ * code hashes are not checked for trusted caches, so check it here.
+ * Arithmetic is on buffer offsets, like sc7_verify_residual_slots.
+ * A region that fails is never a trusted->trusted destination; loading
+ * and every other path are unchanged (fail closed, no sc7_die).
+ */
+static void sc7_verify_poll_entries(void)
+{
+    const uint8_t *buf = supercache.buffer;
+    uint64_t ret = (uintptr_t)tcg_target_tb_ret_addr() - (uintptr_t)buf;
+
+    for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
+        const Sc7RegionEntry *r = &sc7.regions[ri];
+        const Sc7MemberEntry *m = &sc7.members[r->first_member];
+        const uint8_t *code = buf + m->tc_offset;
+        uint64_t want = m->tb_offset + TB_EXIT_REQUESTED;
+        /* The "jl rel32" at +5 ends at +11. */
+        int64_t stub = 11 + (int64_t)(int32_t)ldl_le_p(code + 7);
+        /* The stub must lie past the prefix, inside this member's copy. */
+        const uint8_t *s = (stub >= SC7_TRUSTED_BODY_OFFSET &&
+                            stub + 12 <= (int64_t)m->tc_size) ?
+                           code + stub : NULL;
+        uint64_t value = 0;
+        int64_t jmp = -1;
+        bool ok = false;
+
+        /* sc7_verify_hashes proved bytes 0-6 and 11-14 of the prefix. */
+        if (s && s[0] == 0x48 && s[1] == 0x8d && s[2] == 0x05) {
+            value = m->tc_offset + stub + 7 + (int32_t)ldl_le_p(s + 3);
+            jmp = stub + 7;
+        } else if (s && stub + 15 <= (int64_t)m->tc_size &&
+                   s[0] == 0x48 && s[1] == 0xb8) {
+            value = ldq_le_p(s + 2) - (uintptr_t)buf;
+            jmp = stub + 10;
+        }
+        if (code[SC7_TRUSTED_CAN_DO_IO_OFFSET + 3] == 1 &&
+            jmp >= 0 && value == want && code[jmp] == 0xe9 &&
+            m->tc_offset + jmp + 5 +
+            (int32_t)ldl_le_p(code + jmp + 1) == ret) {
+            ok = true;
+        }
+        sc7.region_poll_entry_ok[ri] = ok;
+        if (ok) {
+            sc7.trusted_poll_entries_verified++;
+        } else {
+            sc7.trusted_poll_entries_unverified++;
+        }
+    }
+}
+
 static void sc7_verify_hashes(void)
 {
     uint8_t *buf = supercache.buffer;
@@ -1520,6 +1625,7 @@ static void sc7_verify_hashes(void)
             }
         }
         sc7_verify_residual_slots();
+        sc7_verify_poll_entries();
     }
     for (uint32_t i = 0; i < sc7.header.n_edges; i++) {
         Sc7EdgeEntry *e = &sc7.edges[i];
@@ -1598,12 +1704,19 @@ static void sc7_verify_hashes(void)
 
 /*
  * QEMU_SC_V7_STATS counter semantics; bump when a counter changes meaning.
- * trusted_residual_slots_skipped, the SC7_MEMBER_SKIP_SLOT bits on valid
- * record slots of the member descriptors built while arming (0 under
- * no-trusted-exit-chain and QEMU_SC_SEALED_SKIP_IRQ, and without a trusted
- * directory), is a new key that changes no counter's meaning.
+ * 4: trusted_residual_slots_skipped, the SC7_MEMBER_SKIP_SLOT bits on valid
+ *    record slots of the member descriptors built while arming (0 under
+ *    no-trusted-exit-chain and QEMU_SC_SEALED_SKIP_IRQ, and without a
+ *    trusted directory).  Trusted->trusted chains enter the destination
+ *    region at +0: chain_allowed_trusted_to_trusted,
+ *    chain_installs_trusted_to_trusted, chain_installs_trusted_self, the
+ *    refusal reasons chain_skipped_trusted_poll_unverified and
+ *    chain_skipped_trusted_unsealed, trusted_poll_entries_verified and
+ *    _unverified (one per loaded region) and trusted_poll_entry_exits.
+ *    chain_skipped_trusted_to_trusted counts only refused trusted->trusted
+ *    attempts.  The experiment object gains no_trusted_to_trusted_chain.
  */
-#define SC7_COUNTERS_REVISION 3
+#define SC7_COUNTERS_REVISION 4
 
 static void sc7_write_loop_return_stats(GString *j)
 {
@@ -1625,7 +1738,15 @@ static void sc7_write_loop_return_stats(GString *j)
         "  \"trusted_residual_slots_armed\": %" PRIu64 ",\n"
         "  \"trusted_residual_slots_skipped\": %" PRIu64 ",\n"
         "  \"chain_allowed_trusted_source\": %" PRIu64 ",\n"
-        "  \"chain_skipped_trusted_to_trusted\": %" PRIu64 ",\n",
+        "  \"chain_skipped_trusted_to_trusted\": %" PRIu64 ",\n"
+        "  \"chain_allowed_trusted_to_trusted\": %" PRIu64 ",\n"
+        "  \"chain_installs_trusted_to_trusted\": %" PRIu64 ",\n"
+        "  \"chain_installs_trusted_self\": %" PRIu64 ",\n"
+        "  \"chain_skipped_trusted_poll_unverified\": %" PRIu64 ",\n"
+        "  \"trusted_poll_entries_verified\": %" PRIu64 ",\n"
+        "  \"trusted_poll_entries_unverified\": %" PRIu64 ",\n"
+        "  \"chain_skipped_trusted_unsealed\": %" PRIu64 ",\n"
+        "  \"trusted_poll_entry_exits\": %" PRIu64 ",\n",
         SC7_COUNTERS_REVISION,
         sc7.loop_returns_nonnull, sc7.trusted_residual_exits,
         sc7.trusted_residual_exits_slot[0],
@@ -1640,7 +1761,15 @@ static void sc7_write_loop_return_stats(GString *j)
         sc7.trusted_residual_slots_armed,
         sc7.trusted_residual_slots_skipped,
         sc7.chain_allowed_trusted_source,
-        sc7.chain_skipped_trusted_to_trusted);
+        sc7.chain_skipped_trusted_to_trusted,
+        sc7.chain_allowed_trusted_to_trusted,
+        sc7.chain_installs_trusted_to_trusted,
+        sc7.chain_installs_trusted_self,
+        sc7.chain_skipped_trusted_poll_unverified,
+        sc7.trusted_poll_entries_verified,
+        sc7.trusted_poll_entries_unverified,
+        sc7.chain_skipped_trusted_unsealed,
+        sc7.trusted_poll_entry_exits);
     g_string_append(j, "  \"trusted_residual_exit_regions\": [");
     for (uint32_t ri = 0;
          sc7.loaded && sc7.region_residual_exits && ri < sc7.header.n_regions;
@@ -1689,7 +1818,8 @@ static void sc7_write_stats(void)
         "\"linear_source_scan\": %s, \"trusted_set\": %s, "
         "\"no_tree\": %s, \"incoming_chain\": %s, "
         "\"disable_chaining\": %s, \"no_regions\": %s, "
-        "\"no_trusted_exit_chain\": %s, \"no_sealed_sc6\": %s},\n",
+        "\"no_trusted_exit_chain\": %s, "
+        "\"no_trusted_to_trusted_chain\": %s, \"no_sealed_sc6\": %s},\n",
         sc7.experiment_source_index ? "true" : "false",
         sc7.experiment_linear_source_scan ? "true" : "false",
         sc7.experiment_trusted_set ? "true" : "false",
@@ -1698,6 +1828,7 @@ static void sc7_write_stats(void)
         sc7.experiment_disable_chaining ? "true" : "false",
         sc7.experiment_no_regions ? "true" : "false",
         sc7.experiment_no_trusted_exit_chain ? "true" : "false",
+        sc7.experiment_no_trusted_to_trusted_chain ? "true" : "false",
         sc7.experiment_no_sealed_sc6 ? "true" : "false");
     g_string_append_printf(j, "  \"file_version\": %" PRIu32 ",\n",
                            supercache.loaded_header.version);
@@ -1808,6 +1939,8 @@ static void sc7_configure_from_env(void)
                 sc7.experiment_no_regions = true;
             } else if (!strcmp(*token, "no-trusted-exit-chain")) {
                 sc7.experiment_no_trusted_exit_chain = true;
+            } else if (!strcmp(*token, "no-trusted-to-trusted-chain")) {
+                sc7.experiment_no_trusted_to_trusted_chain = true;
             } else if (!strcmp(*token, "no-sealed-sc6")) {
                 sc7.experiment_no_sealed_sc6 = true;
             } else {
@@ -3061,6 +3194,8 @@ static TranslationBlock *sc7_register_entry(uint32_t index)
  * Initialize the descriptor of trusted member @mi with its source record's
  * identity.  Its code starts @body bytes into the member copy: the region
  * entry skips the 15-byte IRQ-poll prefix, member descriptors keep it.
+ * (A trusted->trusted chain still enters the region at +0, outside tc.ptr;
+ * see tcg_supercache_chain_target.)
  * With @arm, the residual goto_tb slots (valid in the record, not skipped
  * by the member's SC7_MEMBER_SKIP_SLOT flags and not an admitted internal
  * edge) get the record's offsets rebased to @body, so the dispatcher may
@@ -3376,10 +3511,16 @@ static void sc7_mapping_changed(CPUState *cpu)
  * because a flush also discards and re-memsets every public destination TB
  * (and their jmp_list_head), and a trusted region can only run again after
  * sc7_build_trusted_entry rebuilt its descriptors and reset each armed
- * residual slot.  A reset without a full flush would leave destinations'
- * jump lists pointing into re-zeroed member descriptors, so a later
- * tb_jmp_unlink would truncate them and keep other sources chained into
- * invalidated code.
+ * residual slot.  A trusted destination (a trusted->trusted chain, entered
+ * at +0) is the same: its jmp_list_head is re-memset by its own rebuild, a
+ * stale source still patched to it belongs to a region that cannot run
+ * until its own rebuild resets that slot, and a new chain into it needs a
+ * tb_lookup that returned its rebuilt entry.  Trusted descriptors are never
+ * tb_jmp_unlink'ed: trusted mode ignores mapping changes and code writes
+ * (sc7_mapping_changed, tcg_supercache_code_invalidated).  A reset without
+ * a full flush would leave destinations' jump lists pointing into
+ * re-zeroed member descriptors, so a later tb_jmp_unlink would truncate
+ * them and keep other sources chained into invalidated code.
  */
 static void sc7_runtime_reset(void)
 {
@@ -4149,7 +4290,11 @@ bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
     return sc7_trusted_tb_lookup(tb, true);
 }
 
-/* Region index of a trusted descriptor, or UINT32_MAX.  Stats path only. */
+/*
+ * Region index of a trusted descriptor, or UINT32_MAX.  Not a counted
+ * membership probe (trusted_tb_calls), so the stats path and the
+ * trusted->trusted chain path may both use it.
+ */
 static uint32_t sc7_trusted_region_index(const TranslationBlock *tb)
 {
     if (sc7.trusted_tbs) {
@@ -4223,7 +4368,7 @@ sc7_loop_return_counted(const TranslationBlock *tb, int tb_exit)
  * when the exit slot is not armed (sc7_exit_slot_armed).  That suppresses
  * every exit of a legacy shared trusted descriptor and every unarmed member
  * slot, while an armed residual slot of a member descriptor proceeds to
- * tcg_supercache_chain_allowed.  The stats path also counts dispatcher
+ * tcg_supercache_chain_target.  The stats path also counts dispatcher
  * returns and trusted residual exits.
  */
 bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit)
@@ -4246,8 +4391,58 @@ static bool sc7_chain_probe(const TranslationBlock *tb)
     return sc7_trusted_tb_lookup(tb, true);
 }
 
-bool tcg_supercache_chain_allowed(const TranslationBlock *from,
-                                  const TranslationBlock *to)
+/*
+ * Entry address for a chain from a trusted source into trusted @to, or 0.
+ * tb_lookup never returns a shadow member descriptor (only the entry is
+ * returned by sc7_try_region), so @to must be the entry descriptor of its
+ * region; anything else is refused (counted only in
+ * chain_skipped_trusted_to_trusted, which v7_stats then flags).  The chain
+ * lands on the first byte of the entry member copy: the verified 15-byte
+ * prefix runs its IRQ/exit-request poll and can_do_io store, so every
+ * cycle closed through a trusted->trusted chain contains a poll, just like
+ * a chain into an ordinary TB.  Self-chains (a region exiting to its own
+ * entry) take the same path.  Chains are undone only by tb_flush, which
+ * forgets every descriptor; a region runs again only after
+ * sc7_build_trusted_entry memset its descriptors and reset its armed
+ * slots, and a chain into it is installed only after tb_lookup returned
+ * its rebuilt entry (see sc7_runtime_reset).
+ */
+static uintptr_t sc7_trusted_entry_target(const TranslationBlock *to)
+{
+    uint32_t ri;
+    const Sc7RegionEntry *r;
+
+    if (sc7.experiment_no_trusted_to_trusted_chain) {
+        return 0;
+    }
+    /* Same rule as an ordinary->trusted chain (tcg_supercache_chain_target). */
+    if (!supercache.sealed && !sc7.experiment_incoming_chain) {
+        if (sc7.stats_path) {
+            sc7.chain_skipped_trusted_unsealed++;
+        }
+        return 0;
+    }
+    ri = sc7_trusted_region_index(to);
+    if (ri >= sc7.header.n_regions ||
+        sc7.private_tbs[sc7.regions[ri].first_member] != to) {
+        return 0;
+    }
+    r = &sc7.regions[ri];
+    if (!sc7.region_poll_entry_ok[ri]) {
+        if (sc7.stats_path) {
+            sc7.chain_skipped_trusted_poll_unverified++;
+        }
+        return 0;
+    }
+    /* sc7_init_trusted_descriptor: entry tc.ptr = member code + body. */
+    tcg_debug_assert((const uint8_t *)to->tc.ptr - SC7_TRUSTED_BODY_OFFSET ==
+                     (const uint8_t *)supercache.buffer +
+                     sc7.members[r->first_member].tc_offset);
+    return (uintptr_t)to->tc.ptr - SC7_TRUSTED_BODY_OFFSET;
+}
+
+uintptr_t tcg_supercache_chain_target(const TranslationBlock *from,
+                                      const TranslationBlock *to)
 {
     bool from_trusted;
     bool to_trusted;
@@ -4259,49 +4454,56 @@ bool tcg_supercache_chain_allowed(const TranslationBlock *from,
         if (sc7.stats_path) {
             sc7.chain_skipped_global++;
         }
-        return false;
+        return 0;
     }
     /* Always two probes, so trusted_tb_chain_probes stays
      * 2 * (chain_attempts - chain_skipped_global). */
     from_trusted = sc7_chain_probe(from);
     to_trusted = sc7_chain_probe(to);
     if (from_trusted) {
+        uintptr_t target = (uintptr_t)to->tc.ptr;
+
         /*
          * Only an armed residual slot of a member descriptor gets here.
          * Chaining it to an ordinary TB enters that TB at tc.ptr, so its
-         * IRQ/exit-request poll still runs, and any cycle through the new
-         * edge contains that poll.  A region entry skips its poll (+15),
-         * so trusted -> trusted could close a poll-free cycle: refuse it.
-         * Under QEMU_SC_SEALED_SKIP_IRQ public polls are gone too, so no
-         * trusted source chains at all.  The membership test relies on the
-         * exact descriptor set; its absence would silently admit
-         * shadow -> region-entry chains.
+         * IRQ/exit-request poll still runs.  A trusted region entry's
+         * tc.ptr skips its poll (+15), so a trusted destination is entered
+         * at +0 instead (sc7_trusted_entry_target) and keeps its poll.
+         * Under QEMU_SC_SEALED_SKIP_IRQ public polls are gone too and no
+         * slot is armed, so no trusted source chains at all.  The
+         * membership test relies on the exact descriptor set.
          */
         g_assert(sc7.trusted_tbs);
-        if (to_trusted || supercache.sealed_skip_irq ||
+        if (supercache.sealed_skip_irq ||
             sc7.experiment_no_trusted_exit_chain) {
+            target = 0;
+        } else if (to_trusted) {
+            target = sc7_trusted_entry_target(to);
+        }
+        if (!target) {
             if (sc7.stats_path) {
                 sc7.chain_skipped_trusted_source++;
                 sc7.chain_skipped_trusted_to_trusted += to_trusted;
             }
-            return false;
+            return 0;
         }
         if (sc7.stats_path) {
             sc7.chain_allowed_trusted_source++;
+            sc7.chain_allowed_trusted_to_trusted += to_trusted;
             sc7.chain_allowed++;
         }
-        return true;
+        return target;
     }
     if (to_trusted && !supercache.sealed && !sc7.experiment_incoming_chain) {
         if (sc7.stats_path) {
             sc7.chain_skipped_trusted_destination++;
         }
-        return false;
+        return 0;
     }
     if (sc7.stats_path) {
         sc7.chain_allowed++;
     }
-    return true;
+    return (uintptr_t)to->tc.ptr;
 }
 
 void tcg_supercache_note_chain_result(const TranslationBlock *from,
@@ -4321,7 +4523,36 @@ void tcg_supercache_note_chain_result(const TranslationBlock *from,
         if (sc7.benchmark_window) {
             sc7.benchmark_chain_installs_trusted_source++;
         }
+        if (sc7_trusted_tb_lookup(to, false)) {
+            sc7.chain_installs_trusted_to_trusted++;
+            sc7.chain_installs_trusted_self +=
+                sc7_trusted_region_index(from) == sc7_trusted_region_index(to);
+        }
     }
+}
+
+/*
+ * cpu_tb_exec, QEMU_SC_V7_STATS only: @tb returned TB_EXIT_REQUESTED.  For a
+ * trusted descriptor that is the entry poll of a region entered at +0,
+ * i.e. through a trusted->trusted chain.  Uncounted lookup, so
+ * trusted_tb_calls stays loop_returns_nonnull + trusted_tb_chain_probes.
+ */
+void tcg_supercache_note_exit_requested(const TranslationBlock *tb)
+{
+    uint32_t ri;
+
+    if (!sc7.stats_path || !sc7_trusted_tb_lookup(tb, false)) {
+        return;
+    }
+    /*
+     * Only a region entry entered at +0 runs a trusted poll: every other
+     * member is entered only through internal edges, at +15, and a shadow
+     * descriptor is never executed (tb_lookup returns only entries).
+     */
+    ri = sc7_trusted_region_index(tb);
+    g_assert(ri < sc7.header.n_regions &&
+             sc7.private_tbs[sc7.regions[ri].first_member] == tb);
+    sc7.trusted_poll_entry_exits++;
 }
 
 bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
@@ -4448,10 +4679,14 @@ bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit)
     return false;
 }
 
-bool tcg_supercache_chain_allowed(const TranslationBlock *from,
-                                  const TranslationBlock *to)
+uintptr_t tcg_supercache_chain_target(const TranslationBlock *from,
+                                      const TranslationBlock *to)
 {
-    return true;
+    return (uintptr_t)to->tc.ptr;
+}
+
+void tcg_supercache_note_exit_requested(const TranslationBlock *tb)
+{
 }
 
 void tcg_supercache_note_chain_result(const TranslationBlock *from,
