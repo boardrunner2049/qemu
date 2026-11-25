@@ -1146,12 +1146,14 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
 
-            /* A trusted composite has no descriptor for the particular
-             * member whose residual exit returned here.  Its admitted
-             * internal edges are already linked, so the hook suppresses
-             * the otherwise repeated generic-chain attempt for this
-             * residual exit.  With QEMU_SC_V7_STATS it also counts
-             * dispatcher returns and trusted residual exits. */
+            /* Keep last_tb only when slot tb_exit is armed.  Ordinary TBs
+             * always are.  A trusted region descriptor is armed only for
+             * the residual goto_tb slots of the member that exited, when
+             * the cache has per-member descriptors; the legacy shared
+             * descriptor, internal slots and the no-trusted-exit-chain
+             * arm drop last_tb, so tb_add_jump never patches an invalid
+             * or internal slot.  With QEMU_SC_V7_STATS the hook also
+             * counts dispatcher returns and trusted residual exits. */
             if (last_tb && tcg_supercache_loop_return(last_tb, tb_exit)) {
                 last_tb = NULL;
             }

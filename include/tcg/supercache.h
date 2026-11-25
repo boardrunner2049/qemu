@@ -29,8 +29,10 @@ bool tcg_supercache_trusted_tb(const TranslationBlock *tb);
 /*
  * cpu_exec_loop hook for a TB that returned to the dispatcher with a
  * chainable last_tb.  Returns true to suppress chaining from @tb (the
- * caller nulls last_tb).  Counts dispatcher returns and trusted residual
- * exits when QEMU_SC_V7_STATS is set.
+ * caller nulls last_tb): exactly when goto_tb slot @tb_exit of @tb is not
+ * armed, which for a trusted region descriptor means anything but a
+ * residual slot of a per-member descriptor.  Counts dispatcher returns and
+ * trusted residual exits when QEMU_SC_V7_STATS is set.
  */
 bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit);
 bool tcg_supercache_chain_allowed(const TranslationBlock *from,
