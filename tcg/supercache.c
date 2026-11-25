@@ -953,6 +953,13 @@ static struct {
     bool experiment_no_regions;
     /* Build member descriptors unarmed: residual exits stay unchained. */
     bool experiment_no_trusted_exit_chain;
+    /*
+     * Sealed lookups skip sc6_on_activate, as before sealed B3 support: no
+     * SPEC link arms and no variant is built, while GENERAL slots still
+     * chain through tb_add_jump but are not unlinked on TLB/MPU changes
+     * (sc6.live stays empty).  A/B attribution only; not a safe mode.
+     */
+    bool experiment_no_sealed_sc6;
     bool benchmark_window;
     uint64_t entries;
     uint64_t region_activations;
@@ -1603,7 +1610,7 @@ static void sc7_write_stats(void)
         "\"linear_source_scan\": %s, \"trusted_set\": %s, "
         "\"no_tree\": %s, \"incoming_chain\": %s, "
         "\"disable_chaining\": %s, \"no_regions\": %s, "
-        "\"no_trusted_exit_chain\": %s},\n",
+        "\"no_trusted_exit_chain\": %s, \"no_sealed_sc6\": %s},\n",
         sc7.experiment_source_index ? "true" : "false",
         sc7.experiment_linear_source_scan ? "true" : "false",
         sc7.experiment_trusted_set ? "true" : "false",
@@ -1611,7 +1618,8 @@ static void sc7_write_stats(void)
         sc7.experiment_incoming_chain ? "true" : "false",
         sc7.experiment_disable_chaining ? "true" : "false",
         sc7.experiment_no_regions ? "true" : "false",
-        sc7.experiment_no_trusted_exit_chain ? "true" : "false");
+        sc7.experiment_no_trusted_exit_chain ? "true" : "false",
+        sc7.experiment_no_sealed_sc6 ? "true" : "false");
     g_string_append_printf(j, "  \"file_version\": %" PRIu32 ",\n",
                            supercache.loaded_header.version);
     g_string_append(j, "  \"artifact_id8\": \"");
@@ -1721,6 +1729,8 @@ static void sc7_configure_from_env(void)
                 sc7.experiment_no_regions = true;
             } else if (!strcmp(*token, "no-trusted-exit-chain")) {
                 sc7.experiment_no_trusted_exit_chain = true;
+            } else if (!strcmp(*token, "no-sealed-sc6")) {
+                sc7.experiment_no_sealed_sc6 = true;
             } else {
                 error_report("QEMU_SC_V7_EXPERIMENT: unknown token '%s'", *token);
                 exit(EXIT_FAILURE);
@@ -2535,6 +2545,12 @@ static void sc6_write_stats(void)
     g_string_append_printf(j, "  \"schema\": \"qemu-sc-v6-stats@1\",\n");
     g_string_append_printf(j, "  \"loaded\": %s,\n",
                            sc6.loaded ? "true" : "false");
+    /* Sealed lookups activate sc6 unless QEMU_SC_V7_EXPERIMENT=no-sealed-sc6. */
+    g_string_append_printf(j, "  \"sealed\": %s,\n"
+                           "  \"sealed_activation\": %s,\n",
+                           supercache.sealed ? "true" : "false",
+                           supercache.sealed && !sc7.experiment_no_sealed_sc6 ?
+                           "true" : "false");
     g_string_append_printf(j, "  \"file_version\": %" PRIu32 ",\n",
                            supercache.loaded_header.version);
     g_string_append_printf(j, "  \"feature_flags\": %" PRIu32 ",\n",
@@ -3833,27 +3849,27 @@ static TranslationBlock *lookup_entry(CPUState *cpu, TCGTBCPUState state,
         return tb;
     }
 
-    if (supercache.sealed) {
-        /* Publish the checked exact key into QEMU's fast guest-key table,
-         * code-page lists, and host-address index.  The latter is also used
-         * by plugin attribution; cpu_io_recompile separately rejects sealed
-         * recovery, so indexing does not weaken the no-recovery contract. */
-        tcg_tb_insert(tb);
-        linked = tb_supercache_link(tb);
-        if (linked != tb) {
-            tcg_tb_remove(tb);
-            return linked;
-        }
-        return tb;
-    }
-
+    /* Publish the key into QEMU's fast guest-key table, code-page lists,
+     * and host-address index.  Sealed TBs carry their checked exact key; the
+     * host index is also used by plugin attribution, and cpu_io_recompile
+     * separately rejects sealed recovery, so indexing does not weaken the
+     * no-recovery contract. */
     tcg_tb_insert(tb);
     linked = tb_supercache_link(tb);
     if (linked != tb) {
         tcg_tb_remove(tb);
         return linked;
     }
-    if (unlikely(sc6.loaded)) {
+    /*
+     * Sealed B3 (sc6 extension) activates exactly as unsealed: live R/G
+     * arm SPEC links into variants (tcg_tb_insert region tree only, never
+     * the exact-PC index, so a sealed miss stays fatal and no translation
+     * is made), and sc6.live lets tcg_supercache_mapping_changed unlink
+     * every guarded and variant slot on TLB/MPU changes.  Without this,
+     * GENERAL slots chained by the ordinary loop would survive a flush.
+     */
+    if (unlikely(sc6.loaded) &&
+        !(supercache.sealed && sc7.experiment_no_sealed_sc6)) {
         uint32_t index = entry - supercache.entries;
 
         if (index < sc6.n_entries && sc6.role[index]) {
