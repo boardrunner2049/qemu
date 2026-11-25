@@ -26,6 +26,13 @@ TranslationBlock *tcg_supercache_lookup(CPUState *cpu, TCGTBCPUState state,
                                         tb_page_addr_t phys_pc);
 TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr);
 bool tcg_supercache_trusted_tb(const TranslationBlock *tb);
+/*
+ * cpu_exec_loop hook for a TB that returned to the dispatcher with a
+ * chainable last_tb.  Returns true to suppress chaining from @tb (the
+ * caller nulls last_tb).  Counts dispatcher returns and trusted residual
+ * exits when QEMU_SC_V7_STATS is set.
+ */
+bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit);
 bool tcg_supercache_chain_allowed(const TranslationBlock *from,
                                   const TranslationBlock *to);
 void tcg_supercache_note_chain_result(const TranslationBlock *from,
@@ -124,6 +131,12 @@ static inline bool tcg_supercache_flat_invalidate(TranslationBlock *tb)
 }
 
 static inline bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
+{
+    return false;
+}
+
+static inline bool tcg_supercache_loop_return(const TranslationBlock *tb,
+                                              int tb_exit)
 {
     return false;
 }

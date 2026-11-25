@@ -1148,9 +1148,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
             /* A trusted composite has no descriptor for the particular
              * member whose residual exit returned here.  Its admitted
-             * internal edges are already linked, so suppress the otherwise
-             * repeated generic-chain attempt for this residual exit. */
-            if (last_tb && tcg_supercache_trusted_tb(last_tb)) {
+             * internal edges are already linked, so the hook suppresses
+             * the otherwise repeated generic-chain attempt for this
+             * residual exit.  With QEMU_SC_V7_STATS it also counts
+             * dispatcher returns and trusted residual exits. */
+            if (last_tb && tcg_supercache_loop_return(last_tb, tb_exit)) {
                 last_tb = NULL;
             }
 

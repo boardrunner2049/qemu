@@ -979,6 +979,26 @@ static struct {
     uint64_t benchmark_region_entries;
     uint64_t benchmark_region_activations;
     uint64_t benchmark_tree_insertions;
+    /*
+     * Dispatcher-return counters (counters_revision 2).  loop_returns_nonnull
+     * counts every return to cpu_exec_loop that left a chainable last_tb,
+     * whether or not a v7 directory is loaded.  trusted_residual_exits is
+     * the subset whose last_tb is a trusted region descriptor, i.e. a
+     * residual exit that left the region through the dispatcher.  Exits
+     * through exit_tb(0) (goto_ptr misses) and longjmp exits have no
+     * last_tb, so these are lower bounds on region-caused round trips.
+     */
+    uint64_t loop_returns_nonnull;
+    uint64_t trusted_residual_exits;
+    uint64_t trusted_residual_exits_slot[2];
+    uint64_t trusted_tb_chain_probes;
+    uint64_t chain_installs_trusted_source;
+    uint64_t benchmark_loop_returns_nonnull;
+    uint64_t benchmark_trusted_residual_exits;
+    uint64_t benchmark_trusted_tb_chain_probes;
+    uint64_t benchmark_chain_installs_trusted_source;
+    /* 2 * n_regions: [2 * ri] total, [2 * ri + 1] benchmark window. */
+    uint64_t *region_residual_exits;
     char *stats_path;
 } sc7;
 
@@ -1397,6 +1417,61 @@ static void sc7_verify_hashes(void)
     }
 }
 
+/* QEMU_SC_V7_STATS counter semantics; bump when a counter changes meaning. */
+#define SC7_COUNTERS_REVISION 2
+
+static void sc7_write_loop_return_stats(GString *j)
+{
+    bool first = true;
+
+    g_string_append_printf(j,
+        "  \"counters_revision\": %d,\n"
+        "  \"loop_returns_nonnull\": %" PRIu64 ",\n"
+        "  \"trusted_residual_exits\": %" PRIu64 ",\n"
+        "  \"trusted_residual_exits_slot\": [%" PRIu64 ", %" PRIu64 "],\n"
+        "  \"trusted_tb_chain_probes\": %" PRIu64 ",\n"
+        "  \"chain_installs_trusted_source\": %" PRIu64 ",\n"
+        "  \"benchmark_loop_returns_nonnull\": %" PRIu64 ",\n"
+        "  \"benchmark_trusted_residual_exits\": %" PRIu64 ",\n"
+        "  \"benchmark_trusted_tb_chain_probes\": %" PRIu64 ",\n"
+        "  \"benchmark_chain_installs_trusted_source\": %" PRIu64 ",\n",
+        SC7_COUNTERS_REVISION,
+        sc7.loop_returns_nonnull, sc7.trusted_residual_exits,
+        sc7.trusted_residual_exits_slot[0],
+        sc7.trusted_residual_exits_slot[1],
+        sc7.trusted_tb_chain_probes, sc7.chain_installs_trusted_source,
+        sc7.benchmark_loop_returns_nonnull,
+        sc7.benchmark_trusted_residual_exits,
+        sc7.benchmark_trusted_tb_chain_probes,
+        sc7.benchmark_chain_installs_trusted_source);
+    g_string_append(j, "  \"trusted_residual_exit_regions\": [");
+    for (uint32_t ri = 0;
+         sc7.loaded && sc7.region_residual_exits && ri < sc7.header.n_regions;
+         ri++) {
+        const Sc7RegionEntry *region = &sc7.regions[ri];
+        uint64_t exits = sc7.region_residual_exits[2 * (size_t)ri];
+        uint64_t window = sc7.region_residual_exits[2 * (size_t)ri + 1];
+        uint32_t source = sc7.source_index[region->first_member];
+
+        if (!exits) {
+            continue;
+        }
+        g_string_append_printf(j, "%s\n    {\"region\": %" PRIu32
+                               ", \"region_id8\": \"", first ? "" : ",",
+                               ri);
+        for (int i = 0; i < 8; i++) {
+            g_string_append_printf(j, "%02x", region->region_id8[i]);
+        }
+        g_string_append_printf(j, "\", \"pc\": \"0x%08" PRIx64
+                               "\", \"exits\": %" PRIu64
+                               ", \"benchmark_exits\": %" PRIu64 "}",
+                               (uint64_t)supercache.entries[source].record.pc,
+                               exits, window);
+        first = false;
+    }
+    g_string_append(j, first ? "],\n" : "\n  ],\n");
+}
+
 static void sc7_write_stats(void)
 {
     g_autoptr(GString) j = g_string_new("{\n");
@@ -1429,6 +1504,7 @@ static void sc7_write_stats(void)
         g_string_append_printf(j, "%02x", sc7.header.artifact_id8[i]);
     }
     g_string_append(j, "\",\n");
+    sc7_write_loop_return_stats(j);
     g_string_append_printf(j,
         "  \"regions_loaded\": %" PRIu32 ",\n"
         "  \"members_loaded\": %" PRIu32 ",\n"
@@ -2801,7 +2877,10 @@ static TranslationBlock *sc7_build_trusted_entry(Sc7RegionEntry *region)
     }
     sc7.private_tbs[entry] = tb;
     if (sc7.trusted_tbs) {
-        g_hash_table_add(sc7.trusted_tbs, tb);
+        /* The value is the region index + 1, for residual-exit stats. */
+        g_hash_table_insert(sc7.trusted_tbs, tb,
+                            GUINT_TO_POINTER((guint)(region - sc7.regions) +
+                                             1));
     }
     sc7.members_activated++;
     sc7.region_activations++;
@@ -3737,6 +3816,80 @@ bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
     return sc7_trusted_tb_lookup(tb, true);
 }
 
+/* Region index of a trusted descriptor, or UINT32_MAX.  Stats path only. */
+static uint32_t sc7_trusted_region_index(const TranslationBlock *tb)
+{
+    if (sc7.trusted_tbs) {
+        return GPOINTER_TO_UINT(g_hash_table_lookup(sc7.trusted_tbs, tb)) - 1;
+    }
+    for (uint32_t ri = 0; ri < sc7.header.n_regions; ri++) {
+        if (sc7.private_tbs[sc7.regions[ri].first_member] == tb) {
+            return ri;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static bool __attribute__((noinline))
+sc7_loop_return_counted(const TranslationBlock *tb, int tb_exit)
+{
+    bool trusted = sc7_trusted_tb_lookup(tb, true);
+    uint32_t ri;
+
+    sc7.loop_returns_nonnull++;
+    if (sc7.benchmark_window) {
+        sc7.benchmark_loop_returns_nonnull++;
+    }
+    if (!trusted) {
+        return false;
+    }
+    sc7.trusted_residual_exits++;
+    sc7.trusted_residual_exits_slot[tb_exit & 1]++;
+    if (sc7.benchmark_window) {
+        sc7.benchmark_trusted_residual_exits++;
+    }
+    if (!sc7.region_residual_exits) {
+        sc7.region_residual_exits =
+            g_new0(uint64_t, 2 * (size_t)sc7.header.n_regions);
+    }
+    ri = sc7_trusted_region_index(tb);
+    if (ri < sc7.header.n_regions) {
+        sc7.region_residual_exits[2 * (size_t)ri]++;
+        if (sc7.benchmark_window) {
+            sc7.region_residual_exits[2 * (size_t)ri + 1]++;
+        }
+    }
+    return true;
+}
+
+/*
+ * Called by cpu_exec_loop for every TB that returned to the dispatcher with
+ * a chainable last_tb (tb_exit is TB_EXIT_IDX0 or TB_EXIT_IDX1).  Returns
+ * true when the caller must not chain from @tb (it nulls last_tb).  A
+ * trusted composite has no descriptor for the member whose residual exit
+ * returned here; its admitted internal edges are already linked, so the
+ * otherwise repeated generic-chain attempt is suppressed.
+ */
+bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit)
+{
+    if (unlikely(sc7.stats_path)) {
+        return sc7_loop_return_counted(tb, tb_exit);
+    }
+    return sc7_trusted_tb_lookup(tb, true);
+}
+
+/* A trusted-membership lookup from the generic chaining path. */
+static bool sc7_chain_probe(const TranslationBlock *tb)
+{
+    if (sc7.stats_path && sc7.loaded && sc7.trusted) {
+        sc7.trusted_tb_chain_probes++;
+        if (sc7.benchmark_window) {
+            sc7.benchmark_trusted_tb_chain_probes++;
+        }
+    }
+    return sc7_trusted_tb_lookup(tb, true);
+}
+
 bool tcg_supercache_chain_allowed(const TranslationBlock *from,
                                   const TranslationBlock *to)
 {
@@ -3752,14 +3905,14 @@ bool tcg_supercache_chain_allowed(const TranslationBlock *from,
         }
         return false;
     }
-    from_trusted = tcg_supercache_trusted_tb(from);
+    from_trusted = sc7_chain_probe(from);
     if (from_trusted) {
         if (sc7.stats_path) {
             sc7.chain_skipped_trusted_source++;
         }
         return false;
     }
-    to_trusted = tcg_supercache_trusted_tb(to);
+    to_trusted = sc7_chain_probe(to);
     if (to_trusted && !supercache.sealed && !sc7.experiment_incoming_chain) {
         if (sc7.stats_path) {
             sc7.chain_skipped_trusted_destination++;
@@ -3782,6 +3935,13 @@ void tcg_supercache_note_chain_result(const TranslationBlock *from,
     sc7.chain_installs++;
     if (sc7_trusted_tb_lookup(to, false)) {
         sc7.chain_installs_trusted_destination++;
+    }
+    /* Stays 0 while trusted residual exits are never chained. */
+    if (sc7_trusted_tb_lookup(from, false)) {
+        sc7.chain_installs_trusted_source++;
+        if (sc7.benchmark_window) {
+            sc7.benchmark_chain_installs_trusted_source++;
+        }
     }
 }
 
@@ -3900,6 +4060,11 @@ TranslationBlock *tcg_supercache_host_lookup(uintptr_t tc_ptr)
 }
 
 bool tcg_supercache_trusted_tb(const TranslationBlock *tb)
+{
+    return false;
+}
+
+bool tcg_supercache_loop_return(const TranslationBlock *tb, int tb_exit)
 {
     return false;
 }
